@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Dashboard</h1>
+  <span class="sub" id="updated">Loading…</span>
+  <div class="actions">
+    <input type="text" class="search" id="search" placeholder="Filter by name, client, host, version…">
+    <select id="sort" style="width:auto">
+      <option value="client">Group by client</option>
+      <option value="name">Name</option>
+      <option value="cpu">CPU (high → low)</option>
+      <option value="mem">RAM (high → low)</option>
+      <option value="disk">Storage (high → low)</option>
+      <option value="state">Problems first</option>
+    </select>
+    <button class="btn" id="refresh-all" title="Poll every host now">Refresh all</button>
+    {% if current_user.is_admin %}<a class="btn primary" href="/manage/hosts">Manage hosts</a>{% endif %}
+  </div>
+</div>
+
+<div class="tiles" id="tiles"></div>
+<div class="grid" id="grid"><div class="empty">Loading…</div></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const grid = document.getElementById("grid");
+  const tiles = document.getElementById("tiles");
+  const search = document.getElementById("search");
+  const sortSel = document.getElementById("sort");
+  let data = null;
+
+  try { sortSel.value = localStorage.getItem("pm.sort") || "client"; } catch (e) {}
+
+  function tile(label, value, sub, cls) {
+    return '<div class="tile"><div class="label">' + label + '</div><div class="value ' + (cls || "") + '">' + value + '</div>' +
+      (sub ? '<div class="sub">' + sub + '</div>' : "") + '</div>';
+  }
+
+  function renderTiles(f) {
+    const versions = Object.keys(f.versions).sort().map(function (v) { return v + ' <span class="muted">×' + f.versions[v] + '</span>'; }).join(", ");
+    const hostsCls = f.hosts_error ? "bad-text" : "";
+    tiles.innerHTML =
+      tile("Hosts", f.hosts_ok + '<small>/ ' + f.hosts + '</small>', (f.hosts_error ? f.hosts_error + " with errors" : "all reachable") + (f.hosts_disabled ? ", " + f.hosts_disabled + " disabled" : ""), hostsCls) +
+      tile("Nodes online", f.nodes_online + '<small>/ ' + f.nodes + '</small>', f.cores + " cores total") +
+      tile("Guests", '<span class="ok-text">' + f.guests_running + '</span><small>running</small>', f.guests_stopped + " stopped") +
+      tile("Avg CPU", PM.pct(f.cpu_pct), "weighted by cores", PM.level(f.cpu_pct) + "-text") +
+      tile("RAM", PM.pct(f.mem_pct), PM.bytes(f.mem_used) + " of " + PM.bytes(f.mem_total), PM.level(f.mem_pct, 85, 95) + "-text") +
+      tile("Storage", PM.pct(f.disk_pct), PM.bytes(f.disk_used) + " of " + PM.bytes(f.disk_total), PM.level(f.disk_pct, 80, 90) + "-text") +
+      tile("PVE versions", Object.keys(f.versions).length || "-", versions || "no data yet") +
+      tile("Updates", f.updates, (f.repo_warnings ? '<span class="bad-text">' + f.repo_warnings + ' node(s) can\'t see Proxmox updates</span>' : "") + (f.repo_warnings && f.reboot_pending ? " · " : "") + (f.reboot_pending ? '<span class="bad-text">' + f.reboot_pending + ' node(s) need a reboot</span>' : (f.repo_warnings ? "" : "pending packages across all nodes")), f.updates ? "warn-text" : "");
+  }
+
+  function matches(h, q) {
+    if (!q) return true;
+    const s = h.summary || {};
+    const hay = [h.name, h.client, h.host, s.version, s.cluster_name, (s.pve_versions || []).join(" "), (s.nodes || []).map(function (n) { return n.node; }).join(" ")].join(" ").toLowerCase();
+    return hay.indexOf(q) !== -1;
+  }
+
+  function sortHosts(hosts, mode) {
+    const by = function (k) { return function (a, b) { return ((b.summary || {})[k] || 0) - ((a.summary || {})[k] || 0); }; };
+    const stateRank = { error: 0, pending: 1, ok: 2, disabled: 3 };
+    const copy = hosts.slice();
+    if (mode === "name") copy.sort(function (a, b) { return a.name.localeCompare(b.name); });
+    else if (mode === "cpu") copy.sort(by("cpu_pct"));
+    else if (mode === "mem") copy.sort(by("mem_pct"));
+    else if (mode === "disk") copy.sort(by("disk_pct"));
+    else if (mode === "state") copy.sort(function (a, b) { return stateRank[a.state] - stateRank[b.state] || a.name.localeCompare(b.name); });
+    else copy.sort(function (a, b) { return (a.client || "~").localeCompare(b.client || "~") || a.name.localeCompare(b.name); });
+    return copy;
+  }
+
+  function hostCard(h) {
+    const s = h.summary;
+    const avg = h.average || {};
+    const dot = h.state === "ok" ? "ok" : h.state === "error" ? "bad" : h.state === "pending" ? "warn" : "";
+    let body = "";
+    if (s) {
+      const maxUptime = Math.max.apply(null, [0].concat((s.nodes || []).map(function (n) { return n.uptime || 0; })));
+      const versionBadge = s.pve_versions && s.pve_versions.length > 1
+        ? '<span class="badge warn" title="Nodes are on different versions: ' + PM.esc(s.pve_versions.join(", ")) + '">PVE ' + PM.esc(s.version) + ' (mixed)</span>'
+        : '<span class="badge info">PVE ' + PM.esc(s.version) + '</span>';
+      body +=
+        '<div class="meta">' +
+          versionBadge +
+          (s.is_cluster ? '<span class="badge ' + (s.quorate === false ? "bad" : "") + '" title="Cluster">' + PM.esc(s.cluster_name) + (s.quorate === false ? " – no quorum" : "") + '</span>' : '<span class="badge">standalone</span>') +
+          '<span>Nodes <b>' + s.nodes_online + '/' + s.node_count + '</b></span>' +
+          '<span>Guests <b class="ok-text">' + s.guests_running + '</b> up, <b>' + s.guests_stopped + '</b> down</span>' +
+          '<span>Uptime <b>' + PM.uptime(maxUptime) + '</b></span>' +
+          (s.updates ? '<span class="badge warn" title="Pending apt updates across nodes">' + s.updates + ' update' + (s.updates === 1 ? "" : "s") + '</span>' : "") +
+          (s.repo_warning_nodes && s.repo_warning_nodes.length ? '<span class="badge bad" title="Proxmox updates are not visible on: ' + PM.esc(s.repo_warning_nodes.join(", ")) + ' (enterprise repo without subscription, or no Proxmox repo). Open the host for details.">repo problem</span>' : "") +
+          (s.reboot_pending_nodes && s.reboot_pending_nodes.length ? '<span class="badge bad" title="Newer kernel installed than running on: ' + PM.esc(s.reboot_pending_nodes.join(", ")) + '">reboot pending</span>' : "") +
+        '</div>' +
+        PM.meter("CPU", s.cpu_pct, PM.pct(s.cpu_pct) + (avg.cpu_pct != null ? ' <small>avg ' + PM.pct(avg.cpu_pct) + '</small>' : ""), avg.cpu_pct) +
+        PM.meter("RAM", s.mem_pct, PM.bytes(s.mem_used) + ' <small>/ ' + PM.bytes(s.mem_total) + '</small>', avg.mem_pct, 85, 95) +
+        PM.meter("Disk", s.disk_pct, PM.bytes(s.disk_used) + ' <small>/ ' + PM.bytes(s.disk_total) + '</small>', avg.disk_pct, 80, 90);
+    }
+    if (h.last_error) body += '<div class="err">' + PM.esc(h.last_error) + '</div>';
+    if (!s && !h.last_error) body += '<div class="muted">' + (h.enabled ? "Waiting for first poll…" : "Polling disabled.") + '</div>';
+
+    return '<div class="card host-card ' + h.state + '" data-id="' + h.id + '">' +
+      '<div class="head"><span class="dot ' + dot + '" style="margin-top:6px"></span>' +
+        '<div><div class="title"><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></div>' +
+          '<div class="client">' + PM.esc(h.client || "") + (h.client ? " · " : "") + '<span class="mono">' + PM.esc(h.host) + '</span></div></div>' +
+        '<div class="right"><a class="btn sm" href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open the Proxmox web UI">Open PVE ↗</a></div>' +
+      '</div>' +
+      body +
+      '<div class="foot"><a class="btn sm" href="/hosts/' + h.id + '">Details</a>' +
+        (h.enabled ? '<button class="btn sm" data-refresh="' + h.id + '">Refresh</button>' : "") +
+        '<span class="ago" title="' + PM.esc(h.last_poll_at || "") + '">' + (h.last_ok_at ? "polled " + PM.ago(h.last_ok_at) : "never polled") + '</span></div>' +
+    '</div>';
+  }
+
+  function render() {
+    if (!data) return;
+    renderTiles(data.fleet);
+    const q = search.value.trim().toLowerCase();
+    const mode = sortSel.value;
+    const hosts = sortHosts(data.hosts.filter(function (h) { return matches(h, q); }), mode);
+    if (!hosts.length) {
+      grid.innerHTML = '<div class="empty">' + (data.hosts.length ? "No hosts match your filter." : 'No Proxmox hosts yet.{% if current_user.is_admin %} <a href="/manage/hosts">Add one</a>.{% endif %}') + '</div>';
+      return;
+    }
+    let html = "", lastGroup = null;
+    hosts.forEach(function (h) {
+      if (mode === "client") {
+        const g = h.client || "Ungrouped";
+        if (g !== lastGroup) { html += '<div class="group-title">' + PM.esc(g) + '</div>'; lastGroup = g; }
+      }
+      html += hostCard(h);
+    });
+    grid.innerHTML = html;
+    document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString() + " · polls every " + data.poll_interval + "s · averages over " + data.average_window_minutes + " min";
+  }
+
+  async function load() {
+    try {
+      data = await PM.api("GET", "/api/dashboard");
+      render();
+    } catch (e) {
+      document.getElementById("updated").textContent = "Failed to load: " + e.message;
+    }
+  }
+
+  search.addEventListener("input", render);
+  sortSel.addEventListener("change", function () { try { localStorage.setItem("pm.sort", sortSel.value); } catch (e) {} render(); });
+
+  document.getElementById("refresh-all").addEventListener("click", async function () {
+    const btn = this;
+    PM.busy(btn, true, "Polling");
+    try { await PM.api("POST", "/api/refresh-all"); PM.toast("Polling all hosts in the background. Results will appear as they come in."); }
+    catch (e) { PM.toast(e.message, "bad"); }
+    finally { PM.busy(btn, false); setTimeout(load, 4000); setTimeout(load, 15000); }
+  });
+
+  grid.addEventListener("click", async function (e) {
+    const btn = e.target.closest("[data-refresh]");
+    if (!btn) return;
+    PM.busy(btn, true, "Polling");
+    try {
+      const r = await PM.api("POST", "/api/hosts/" + btn.getAttribute("data-refresh") + "/refresh");
+      if (!r.ok) PM.toast(r.error, "bad");
+      await load();
+    } catch (err) { PM.toast(err.message, "bad"); PM.busy(btn, false); }
+  });
+
+  load();
+  setInterval(load, 30000);
+})();
+</script>
+{% endblock %}

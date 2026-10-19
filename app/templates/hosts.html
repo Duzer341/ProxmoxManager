@@ -1,0 +1,538 @@
+{% extends "base.html" %}
+{% block title %}Hosts - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Proxmox hosts</h1>
+  <span class="sub">Each entry is one API endpoint. For a cluster, add any one member and the whole cluster is collected.</span>
+  <div class="actions"><button class="btn primary" id="add">Add host</button></div>
+</div>
+
+<div class="card" style="margin-bottom:14px" id="sshkey-card">
+  <div class="flex" style="justify-content:space-between; align-items:flex-start">
+    <div>
+      <b>Dashboard SSH key</b>
+      <div class="muted" style="font-size:12.5px">Lets the dashboard run updates and reboots over SSH. Install it once per Proxmox host, then click <b>Enable SSH &amp; test</b>.</div>
+    </div>
+    <button class="btn sm" id="sshkey-generate">Generate key</button>
+  </div>
+  <div id="sshkey-body" style="display:none; margin-top:12px">
+    <div class="flex" style="justify-content:space-between">
+      <div class="seg" id="sshkey-views">
+        <button class="seg-btn" data-view="install">Install command</button>
+        <button class="seg-btn" data-view="remote">Install from your PC</button>
+        <button class="seg-btn" data-view="pub">Public key</button>
+      </div>
+      <div class="flex" id="sshkey-host-wrap">
+        <label for="sshkey-host" style="margin:0">For host</label>
+        <select id="sshkey-host" style="width:auto; min-width:220px"></select>
+      </div>
+    </div>
+    <div class="hint" id="sshkey-hint" style="margin:8px 0 6px"></div>
+    <div class="codebox">
+      <button class="btn sm codebox-copy" id="sshkey-copy">Copy</button>
+      <pre id="sshkey-text" class="mono"></pre>
+    </div>
+    <div class="flex" id="sshkey-enable-wrap" style="margin-top:10px">
+      <a class="btn sm" id="sshkey-shell" target="_blank" rel="noopener">Open Proxmox web UI ↗</a>
+      <button class="btn sm primary" id="sshkey-enable">Enable SSH &amp; test</button>
+      <span id="sshkey-status" style="font-size:12.5px"></span>
+    </div>
+  </div>
+</div>
+
+<div class="card table-wrap" style="padding:0">
+  <table id="hosts"><thead><tr>
+    <th>Name</th><th>Client</th><th>Endpoint</th><th>Auth</th><th>PVE user</th><th>SSL</th><th>SSH</th><th>Status</th><th>Last OK</th><th></th>
+  </tr></thead><tbody><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table>
+</div>
+
+<div class="modal-bg" id="host-modal">
+  <div class="modal">
+    <h2 id="modal-title">Add host</h2>
+    <form id="host-form" autocomplete="off">
+      <input type="hidden" id="f-id">
+      <div class="row">
+        <div class="field"><label>Display name</label><input type="text" id="f-name" required placeholder="e.g. ACME PVE cluster"></div>
+        <div class="field"><label>Client / group (optional)</label><input type="text" id="f-client" placeholder="e.g. ACME Corp" list="client-list"><datalist id="client-list"></datalist></div>
+      </div>
+      <div class="row three">
+        <div class="field"><label>Host (IP or DNS name)</label><input type="text" id="f-host" required placeholder="10.0.0.5 or pve1.client.local"></div>
+        <div class="field"><label>Port</label><input type="number" id="f-port" value="8006" min="1" max="65535"></div>
+        <div class="field inline" style="margin-top:22px"><input type="checkbox" id="f-verify"><label for="f-verify">Verify SSL</label></div>
+      </div>
+      <div class="field">
+        <label>Web UI link override (optional)</label>
+        <input type="url" id="f-web" placeholder="https://pve.client.local:8006/">
+        <div class="hint">Defaults to https://host:port/. Set this if the dashboard reaches the host on a different address than you do.</div>
+      </div>
+      <div class="field"><label>Auth type</label>
+        <select id="f-auth"><option value="token">API token (recommended)</option><option value="password">Username / password</option></select>
+      </div>
+      <div class="row">
+        <div class="field" id="f-tokenid-wrap">
+          <label>Token ID</label><input type="text" id="f-tokenid" placeholder="monitor@pve!dashboard" spellcheck="false">
+          <div class="hint">Exactly as shown in Datacenter → Permissions → API Tokens: <span class="kbd">user@realm!tokenname</span></div>
+        </div>
+        <div class="field" id="f-user-wrap" style="display:none">
+          <label>PVE user (with realm)</label><input type="text" id="f-user" placeholder="root@pam" spellcheck="false">
+        </div>
+        <div class="field">
+          <label id="f-secret-label">Token secret</label><input type="password" id="f-secret" autocomplete="new-password">
+          <div class="hint" id="f-secret-hint">The value Proxmox showed once when the token was created.</div>
+        </div>
+      </div>
+      <div class="hint" id="f-privsep-hint" style="margin:-6px 0 12px">
+        The token needs permissions: either untick <b>Privilege Separation</b> when creating it (it then inherits the user's roles),
+        or give the token itself a role under Datacenter → Permissions → Add → <b>API Token Permission</b> (path <span class="kbd">/</span>, role <span class="kbd">PVEAuditor</span>).
+      </div>
+      <div class="field"><label>Notes (shown on the host page)</label><textarea id="f-notes" placeholder="Site, VPN, contact…"></textarea></div>
+      <div class="field inline"><input type="checkbox" id="f-enabled" checked><label for="f-enabled">Enabled (poll this host)</label></div>
+
+      <div style="border-top:1px solid var(--border); margin:14px 0 12px"></div>
+      <div class="field inline"><input type="checkbox" id="f-ssh"><label for="f-ssh"><b>SSH access</b> — needed for Update node / Reboot node (the PVE API cannot run apt)</label></div>
+      <div id="ssh-fields" style="display:none">
+        <div class="row three">
+          <div class="field"><label>SSH auth</label>
+            <select id="f-ssh-auth">
+              <option value="appkey">Dashboard key (recommended)</option>
+              <option value="key">Private key (paste)</option>
+              <option value="password">Password</option>
+            </select>
+          </div>
+          <div class="field"><label>SSH user</label><input type="text" id="f-ssh-user" value="root" spellcheck="false"></div>
+          <div class="field"><label>SSH port</label><input type="number" id="f-ssh-port" value="22" min="1" max="65535"></div>
+        </div>
+        <div class="field" id="f-ssh-secret-wrap" style="display:none">
+          <label id="f-ssh-secret-label">Private key</label>
+          <textarea id="f-ssh-secret" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false" style="font-family:var(--mono); font-size:12px"></textarea>
+          <input type="password" id="f-ssh-password" autocomplete="new-password" style="display:none">
+          <div class="hint" id="f-ssh-secret-hint"></div>
+        </div>
+        <div class="field">
+          <label>Per-node SSH address overrides (clusters only, optional)</label>
+          <textarea id="f-ssh-addrs" rows="2" placeholder="pve1=10.0.0.11&#10;pve2=10.0.0.12" spellcheck="false" style="font-family:var(--mono); font-size:12px"></textarea>
+          <div class="hint">By default the cluster-reported node IP is used, or the host address above for a single node.</div>
+        </div>
+        <div class="flex">
+          <button type="button" class="btn sm" id="ssh-test">Test SSH</button>
+          <button type="button" class="btn sm" id="ssh-forget" style="display:none" title="Clear pinned SSH host keys (after a node reinstall)">Forget SSH host keys</button>
+          <span class="muted" id="ssh-test-status" style="font-size:12.5px"></span>
+        </div>
+      </div>
+      <div class="foot">
+        <button type="button" class="btn danger" id="f-delete" style="display:none; margin-right:auto">Delete host</button>
+        <span class="status" id="test-status"></span>
+        <button type="button" class="btn" id="test">Test connection</button>
+        <button type="button" class="btn" data-close="host-modal">Cancel</button>
+        <button type="submit" class="btn primary" id="save">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+<div class="modal-bg" id="delete-modal">
+  <div class="modal" style="max-width:620px">
+    <h2 id="del-title">Delete host</h2>
+    <div id="del-body"></div>
+    <div class="field" style="margin-top:12px"><label id="del-label">Type the host name to confirm</label><input type="text" id="del-input" autocomplete="off" spellcheck="false"></div>
+    <div class="foot">
+      <span class="status bad-text" id="del-status"></span>
+      <button class="btn" data-close="delete-modal">Cancel</button>
+      <button class="btn danger" id="del-go" style="background:rgba(248,81,73,.12); border-color:var(--bad)">Delete host</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="deleted-modal">
+  <div class="modal" style="max-width:680px">
+    <h2 id="deleted-title">Host deleted</h2>
+    <div id="deleted-body"></div>
+    <div class="foot"><button class="btn primary" data-close="deleted-modal">Done</button></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const tb = document.querySelector("#hosts tbody");
+  let hosts = [];
+  const $ = function (id) { return document.getElementById(id); };
+
+  function render() {
+    const clients = {};
+    hosts.forEach(function (h) { if (h.client) clients[h.client] = 1; });
+    $("client-list").innerHTML = Object.keys(clients).sort().map(function (c) { return '<option value="' + PM.esc(c) + '">'; }).join("");
+    if (!hosts.length) { tb.innerHTML = '<tr><td colspan="10" class="empty">No hosts yet. Click "Add host".</td></tr>'; return; }
+    tb.innerHTML = hosts.map(function (h) {
+      const status = !h.enabled ? '<span class="badge">disabled</span>' : h.last_error ? '<span class="badge bad" title="' + PM.esc(h.last_error) + '">error</span>' : h.last_ok_at ? '<span class="badge ok">ok</span>' : '<span class="badge warn">pending</span>';
+      return '<tr>' +
+        '<td><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></td>' +
+        '<td>' + PM.esc(h.client || "-") + '</td>' +
+        '<td class="mono">' + PM.esc(h.host) + ':' + h.port + ' <a href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open PVE">↗</a></td>' +
+        '<td><span class="badge">' + (h.auth_type === "token" ? "token" : "password") + '</span></td>' +
+        '<td class="mono">' + PM.esc(h.pve_user) + (h.auth_type === "token" ? "!" + PM.esc(h.token_name) : "") + '</td>' +
+        '<td>' + (h.verify_ssl ? "verify" : '<span class="muted">skip</span>') + '</td>' +
+        '<td>' + (h.ssh_enabled ? '<span class="badge ok" title="' + PM.esc(h.ssh_user + "@:" + h.ssh_port + " · " + h.ssh_auth) + '">' + (h.ssh_auth === "appkey" ? "key" : h.ssh_auth) + '</span>' : '<span class="muted">off</span>') + '</td>' +
+        '<td>' + status + (h.last_error ? '<div class="err" style="max-width:260px">' + PM.esc(h.last_error) + '</div>' : "") + '</td>' +
+        '<td class="muted nowrap">' + (h.last_ok_at ? PM.ago(h.last_ok_at) : "never") + '</td>' +
+        '<td class="nowrap right"><button class="btn sm" data-edit="' + h.id + '">Edit</button> <button class="btn sm danger" data-del="' + h.id + '">Delete</button></td>' +
+      '</tr>';
+    }).join("");
+  }
+
+  async function load() {
+    try { hosts = await PM.api("GET", "/api/hosts"); render(); if (pubKey) renderKey(); }
+    catch (e) { PM.toast(e.message, "bad"); }
+  }
+
+  function syncAuthFields() {
+    const token = $("f-auth").value === "token";
+    $("f-tokenid-wrap").style.display = token ? "" : "none";
+    $("f-user-wrap").style.display = token ? "none" : "";
+    $("f-privsep-hint").style.display = token ? "" : "none";
+    $("f-tokenid").required = token;
+    $("f-user").required = !token;
+    $("f-secret-label").textContent = token ? "Token secret" : "Password";
+    const editing = !!$("f-id").value;
+    $("f-secret-hint").textContent = editing ? "Leave blank to keep the stored value." : (token ? "The value Proxmox showed once when the token was created." : "");
+  }
+  $("f-auth").addEventListener("change", syncAuthFields);
+
+  function syncSshFields() {
+    const on = $("f-ssh").checked, auth = $("f-ssh-auth").value, editing = !!$("f-id").value;
+    $("ssh-fields").style.display = on ? "" : "none";
+    $("f-ssh-secret-wrap").style.display = auth === "appkey" ? "none" : "";
+    $("f-ssh-secret").style.display = auth === "key" ? "" : "none";
+    $("f-ssh-password").style.display = auth === "password" ? "" : "none";
+    $("f-ssh-secret-label").textContent = auth === "key" ? "Private key (OpenSSH/PEM, no passphrase)" : "Password";
+    $("f-ssh-secret-hint").textContent = editing ? "Leave blank to keep the stored value." : "";
+    $("ssh-forget").style.display = editing ? "" : "none";
+  }
+  $("f-ssh").addEventListener("change", syncSshFields);
+  $("f-ssh-auth").addEventListener("change", syncSshFields);
+
+  function sshSecret() {
+    const auth = $("f-ssh-auth").value;
+    return auth === "key" ? $("f-ssh-secret").value : auth === "password" ? $("f-ssh-password").value : "";
+  }
+
+  function openForm(h) {
+    $("host-form").reset();
+    $("test-status").textContent = "";
+    $("ssh-test-status").textContent = "";
+    $("f-ssh").checked = h ? !!h.ssh_enabled : false;
+    $("f-ssh-auth").value = h ? (h.ssh_auth || "appkey") : "appkey";
+    $("f-ssh-user").value = h ? (h.ssh_user || "root") : "root";
+    $("f-ssh-port").value = h ? (h.ssh_port || 22) : 22;
+    $("f-ssh-secret").value = ""; $("f-ssh-password").value = "";
+    $("f-ssh-addrs").value = h ? (h.ssh_node_addrs || "") : "";
+    $("f-id").value = h ? h.id : "";
+    $("modal-title").textContent = h ? "Edit host" : "Add host";
+    $("f-name").value = h ? h.name : "";
+    $("f-client").value = h ? h.client : "";
+    $("f-host").value = h ? h.host : "";
+    $("f-port").value = h ? h.port : 8006;
+    $("f-verify").checked = h ? h.verify_ssl : false;
+    $("f-web").value = h ? h.web_url : "";
+    $("f-auth").value = h ? h.auth_type : "token";
+    $("f-tokenid").value = h && h.auth_type === "token" ? h.token_id : "";
+    $("f-user").value = h && h.auth_type === "password" ? h.pve_user : "";
+    $("f-secret").value = "";
+    $("f-notes").value = h ? h.notes : "";
+    $("f-enabled").checked = h ? h.enabled : true;
+    syncAuthFields();
+    syncSshFields();
+    $("f-delete").style.display = h ? "" : "none";
+    PM.openModal("host-modal");
+    $("f-name").focus();
+  }
+
+  function formBody() {
+    return {
+      name: $("f-name").value.trim(),
+      client: $("f-client").value.trim(),
+      host: $("f-host").value.trim(),
+      port: parseInt($("f-port").value, 10) || 8006,
+      web_url: $("f-web").value.trim(),
+      verify_ssl: $("f-verify").checked,
+      auth_type: $("f-auth").value,
+      token_id: $("f-auth").value === "token" ? $("f-tokenid").value.trim() : "",
+      pve_user: $("f-auth").value === "password" ? $("f-user").value.trim() : "",
+      secret: $("f-secret").value,
+      enabled: $("f-enabled").checked,
+      notes: $("f-notes").value,
+      ssh_enabled: $("f-ssh").checked,
+      ssh_user: $("f-ssh-user").value.trim() || "root",
+      ssh_port: parseInt($("f-ssh-port").value, 10) || 22,
+      ssh_auth: $("f-ssh-auth").value,
+      ssh_secret: sshSecret(),
+      ssh_node_addrs: $("f-ssh-addrs").value
+    };
+  }
+
+  // ---- SSH: test + forget keys ----
+  $("ssh-test").addEventListener("click", async function () {
+    const btn = this, st = $("ssh-test-status");
+    const body = { host: $("f-host").value.trim(), ssh_user: $("f-ssh-user").value.trim() || "root",
+      ssh_port: parseInt($("f-ssh-port").value, 10) || 22, ssh_auth: $("f-ssh-auth").value, ssh_secret: sshSecret() };
+    if ($("f-id").value) body.host_id = parseInt($("f-id").value, 10);
+    if (!body.host) { st.className = "bad-text"; st.textContent = "Enter the host address first."; return; }
+    PM.busy(btn, true, "Testing");
+    st.className = "muted"; st.textContent = "Connecting…";
+    try {
+      const r = await PM.api("POST", "/api/ssh/test", body);
+      if (r.ok) { st.className = r.warning ? "warn-text" : "ok-text"; st.textContent = "OK — " + r.hostname + (r.pveversion ? " · " + r.pveversion : "") + " · kernel " + r.kernel + (r.warning ? " · " + r.warning : ""); }
+      else { st.className = "bad-text"; st.textContent = r.error; }
+    } catch (err) { st.className = "bad-text"; st.textContent = err.message; }
+    PM.busy(btn, false);
+  });
+  $("ssh-forget").addEventListener("click", async function () {
+    const id = $("f-id").value; if (!id) return;
+    if (!confirm("Forget the pinned SSH host keys for this host? Only do this after a node was reinstalled.")) return;
+    try { const r = await PM.api("POST", "/api/hosts/" + id + "/ssh/forget-keys"); PM.toast("Removed " + r.removed + " pinned key(s)", "ok"); }
+    catch (err) { PM.toast(err.message, "bad"); }
+  });
+
+  // ---- Dashboard SSH key card ----
+  let pubKey = "";
+  let keyView = "install";
+  try { keyView = localStorage.getItem("pm.keyView") || "install"; } catch (e) {}
+
+  function selectedHost() {
+    const id = $("sshkey-host").value;
+    return hosts.find(function (h) { return String(h.id) === id; }) || null;
+  }
+
+  // Script pasted into a root shell on the node. Idempotent; works whether
+  // /root/.ssh/authorized_keys is a plain file or Proxmox's symlink into /etc/pve/priv.
+  function installScript(h) {
+    const nodes = h && h.nodes && h.nodes.length ? h.nodes.join(", ") : "?";
+    return [
+      "# Proxmox Manager: authorize the dashboard's SSH key",
+      "# Host: " + (h ? h.name + (h.client ? " (" + h.client + ")" : "") + " - " + h.host + " - node(s): " + nodes : "-"),
+      "# Paste into a root shell on the node. Safe to run more than once.",
+      "KEY='" + pubKey + "'",
+      "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+      "touch /root/.ssh/authorized_keys",
+      "grep -qxF \"$KEY\" /root/.ssh/authorized_keys || echo \"$KEY\" >> /root/.ssh/authorized_keys",
+      "[ -L /root/.ssh/authorized_keys ] || chmod 600 /root/.ssh/authorized_keys",
+      "grep -qxF \"$KEY\" /root/.ssh/authorized_keys && echo \"OK: Proxmox Manager key installed on $(hostname)\" || echo \"FAILED: key not in authorized_keys\""
+    ].join("\n");
+  }
+
+  // One command to run from a workstation; asks for the node's root password once.
+  function remoteCommand(h) {
+    const target = "root@" + (h ? h.host : "<node-ip>");
+    const inner = "KEY=\"" + pubKey + "\"; mkdir -p /root/.ssh && chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; " +
+      "grep -qxF \"$KEY\" /root/.ssh/authorized_keys || echo \"$KEY\" >> /root/.ssh/authorized_keys; " +
+      "[ -L /root/.ssh/authorized_keys ] || chmod 600 /root/.ssh/authorized_keys; " +
+      "grep -qxF \"$KEY\" /root/.ssh/authorized_keys && echo \"OK: key installed on $(hostname)\"";
+    return "ssh " + target + " '" + inner + "'";
+  }
+
+  function renderKey() {
+    const has = !!pubKey;
+    $("sshkey-body").style.display = has ? "" : "none";
+    $("sshkey-generate").textContent = has ? "Regenerate key" : "Generate key";
+    if (!has) return;
+
+    // host dropdown (keep selection)
+    const sel = $("sshkey-host"), prev = sel.value;
+    sel.innerHTML = hosts.map(function (h) {
+      return '<option value="' + h.id + '">' + PM.esc(h.name) + ' — ' + PM.esc(h.host) + (h.ssh_enabled ? '  ✓ SSH on' : '') + '</option>';
+    }).join("");
+    if (prev && hosts.some(function (h) { return String(h.id) === prev; })) sel.value = prev;
+    else { const firstOff = hosts.find(function (h) { return !h.ssh_enabled; }); if (firstOff) sel.value = String(firstOff.id); }
+
+    const h = selectedHost();
+    document.querySelectorAll("#sshkey-views .seg-btn").forEach(function (b) { b.classList.toggle("active", b.dataset.view === keyView); });
+    $("sshkey-host-wrap").style.display = keyView === "pub" ? "none" : "";
+    $("sshkey-enable-wrap").style.display = keyView === "pub" || !h ? "none" : "";
+
+    let text, hint;
+    if (keyView === "pub") {
+      text = pubKey;
+      hint = "The dashboard's public key. It goes on its own line in /root/.ssh/authorized_keys on each Proxmox node.";
+    } else if (keyView === "remote") {
+      text = remoteCommand(h);
+      hint = "Run this in a Linux or macOS terminal on your PC. It asks for " + (h ? h.host : "the node") + "'s root password once.";
+    } else {
+      text = installScript(h);
+      const multi = h && h.nodes && h.nodes.length > 1;
+      hint = "Paste into a root shell on " + (h ? h.name : "the node") + ": Proxmox web UI → node → Shell, or ssh root@" + (h ? h.host : "node") + "." +
+        (multi ? " This is a cluster: run it on every node (Proxmox usually shares this file across the cluster, so later runs just print OK)." : "");
+    }
+    $("sshkey-text").textContent = text;
+    $("sshkey-hint").textContent = hint;
+    if (h) {
+      $("sshkey-shell").href = h.ui_url;
+      $("sshkey-enable").textContent = h.ssh_enabled ? "Re-test SSH" : "Enable SSH & test";
+    }
+  }
+
+  async function loadKey() {
+    try { const r = await PM.api("GET", "/api/ssh/key"); pubKey = r.public_key || ""; renderKey(); }
+    catch (e) { PM.toast(e.message, "bad"); }
+  }
+
+  // Clipboard API needs HTTPS; fall back to execCommand, which works on plain http too.
+  function copyText(text, label) {
+    function legacy() {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.top = "-1000px";
+      document.body.appendChild(ta); ta.select();
+      let ok = false; try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { PM.toast(label + " copied", "ok"); },
+        function () { legacy() ? PM.toast(label + " copied", "ok") : selectBox(); });
+    } else if (legacy()) {
+      PM.toast(label + " copied", "ok");
+    } else { selectBox(); }
+  }
+  function selectBox() {
+    const r = document.createRange(); r.selectNodeContents($("sshkey-text"));
+    const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+    PM.toast("Text selected — press Ctrl+C to copy", "");
+  }
+
+  document.querySelectorAll("#sshkey-views .seg-btn").forEach(function (b) {
+    b.addEventListener("click", function () { keyView = b.dataset.view; try { localStorage.setItem("pm.keyView", keyView); } catch (e) {} renderKey(); });
+  });
+  $("sshkey-host").addEventListener("change", function () { $("sshkey-status").textContent = ""; renderKey(); });
+  $("sshkey-text").addEventListener("dblclick", selectBox);
+  $("sshkey-copy").addEventListener("click", function () {
+    copyText($("sshkey-text").textContent, keyView === "pub" ? "Public key" : "Command");
+  });
+  $("sshkey-generate").addEventListener("click", async function () {
+    if (pubKey && !confirm("Regenerate the dashboard SSH key? Every node that trusts the current key will need the new key installed, and SSH jobs will fail until then.")) return;
+    PM.busy(this, true, "Generating");
+    try { const r = await PM.api("POST", "/api/ssh/key/generate"); pubKey = r.public_key; PM.toast("Key generated", "ok"); }
+    catch (e) { PM.toast(e.message, "bad"); }
+    PM.busy(this, false); renderKey();
+  });
+  $("sshkey-enable").addEventListener("click", async function () {
+    const h = selectedHost(); if (!h) return;
+    const btn = this, st = $("sshkey-status");
+    PM.busy(btn, true, "Testing");
+    st.className = "muted"; st.textContent = "Connecting to root@" + h.host + ":" + (h.ssh_port || 22) + " …";
+    try {
+      const r = await PM.api("POST", "/api/hosts/" + h.id + "/ssh/enable");
+      if (r.ok) {
+        st.className = "ok-text";
+        st.textContent = "SSH enabled — " + r.hostname + " · " + (r.pveversion || "").split(" ")[0] + " · kernel " + r.kernel + ". Update node (SSH) is now available on the host page.";
+        await load();
+      } else {
+        st.className = "bad-text"; st.textContent = r.error + " (SSH left off for this host)";
+      }
+    } catch (err) { st.className = "bad-text"; st.textContent = err.message; }
+    PM.busy(btn, false); renderKey();
+  });
+
+  $("add").addEventListener("click", function () { openForm(null); });
+
+  tb.addEventListener("click", async function (e) {
+    const edit = e.target.closest("[data-edit]"), del = e.target.closest("[data-del]");
+    if (edit) {
+      const h = hosts.find(function (x) { return x.id == edit.getAttribute("data-edit"); });
+      openForm(h);
+    } else if (del) {
+      const h = hosts.find(function (x) { return x.id == del.getAttribute("data-del"); });
+      openDelete(h);
+    }
+  });
+
+  $("test").addEventListener("click", async function () {
+    const btn = this, st = $("test-status");
+    const body = formBody();
+    if ($("f-id").value) body.host_id = parseInt($("f-id").value, 10);
+    PM.busy(btn, true, "Testing");
+    st.className = "status muted"; st.textContent = "Connecting…";
+    try {
+      const r = await PM.api("POST", "/api/hosts/test", body);
+      if (r.ok) { st.className = "status ok-text"; st.textContent = "OK — PVE " + r.version + ", nodes: " + r.nodes.join(", "); }
+      else { st.className = "status bad-text"; st.textContent = r.error; }
+    } catch (err) { st.className = "status bad-text"; st.textContent = err.message; }
+    PM.busy(btn, false);
+  });
+
+  $("host-form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const id = $("f-id").value, btn = $("save");
+    PM.busy(btn, true, "Saving");
+    try {
+      if (id) await PM.api("PUT", "/api/hosts/" + id, formBody());
+      else await PM.api("POST", "/api/hosts", formBody());
+      PM.closeModal("host-modal");
+      PM.toast("Saved. Polling now…", "ok");
+      await load();
+      setTimeout(load, 5000);
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+
+  // ---- Delete host ----
+  let deleting = null;
+  function cleanupCommands(h) {
+    const out = [];
+    if (h.auth_type === "token" && h.token_id) {
+      const parts = h.token_id.split("!");
+      out.push("# Revoke the API token the dashboard used\npveum user token remove " + parts[0] + " " + parts[1]);
+    }
+    if (h.ssh_enabled) {
+      out.push("# Remove the dashboard's SSH key (only if no other dashboard host uses this node)\nsed -i --follow-symlinks '/ proxmox-manager$/d' /root/.ssh/authorized_keys");
+    }
+    return out.join("\n\n");
+  }
+  function openDelete(h) {
+    if (!h) return;
+    deleting = h;
+    PM.closeModal("host-modal");
+    $("del-title").textContent = 'Delete "' + h.name + '"';
+    $("del-status").textContent = "";
+    $("del-input").value = "";
+    $("del-label").textContent = 'Type "' + h.name + '" to confirm';
+    $("del-body").innerHTML =
+      '<p>Removes <b>' + PM.esc(h.name) + '</b> (' + PM.esc(h.host) + (h.client ? ', ' + PM.esc(h.client) : '') + ') from the dashboard, together with its stored credentials, CPU/RAM/storage history, SMART results, job history and pinned SSH host keys.</p>' +
+      '<p class="muted">Nothing is changed on the Proxmox server itself' + (cleanupCommands(h) ? ' — the cleanup commands are shown after deleting.' : '.') + '</p>';
+    PM.openModal("delete-modal");
+    $("del-input").focus();
+  }
+  $("f-delete").addEventListener("click", function () {
+    const h = hosts.find(function (x) { return String(x.id) === $("f-id").value; }); openDelete(h);
+  });
+  $("del-input").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("del-go").click(); } });
+  $("del-go").addEventListener("click", async function () {
+    const h = deleting; if (!h) return;
+    if ($("del-input").value.trim() !== h.name) { $("del-status").textContent = 'Type the host name exactly: ' + h.name; return; }
+    PM.busy(this, true, "Deleting");
+    try {
+      await PM.api("DELETE", "/api/hosts/" + h.id);
+      PM.closeModal("delete-modal");
+      const cmds = cleanupCommands(h);
+      $("deleted-title").textContent = '"' + h.name + '" deleted';
+      $("deleted-body").innerHTML = cmds
+        ? '<p>The host is gone from the dashboard. To also revoke the dashboard\'s access on the Proxmox server, run this in a root shell on ' + PM.esc(h.host) + ' (Proxmox web UI → node → Shell):</p>' +
+          '<div class="codebox"><button class="btn sm codebox-copy" id="deleted-copy">Copy</button><pre class="mono" id="deleted-cmds"></pre></div>' +
+          '<p class="muted" style="margin-top:8px">Optional, but recommended when a client is offboarded or the server is reassigned.</p>'
+        : '<p>The host is gone from the dashboard. It used password auth and no SSH key, so there is nothing to revoke on the server (change the password if the client is offboarded).</p>';
+      if (cmds) { $("deleted-cmds").textContent = cmds; $("deleted-copy").addEventListener("click", function () { PM.copy(cmds, "Cleanup commands"); }); }
+      PM.openModal("deleted-modal");
+      if (history.replaceState) history.replaceState(null, "", "/manage/hosts");
+      await load();
+    } catch (err) { $("del-status").textContent = err.message; }
+    PM.busy(this, false);
+  });
+
+  load().then(loadKey).then(function () {
+    const qs = new URLSearchParams(location.search);
+    const editId = qs.get("edit"), delId = qs.get("delete");
+    if (editId) { const h = hosts.find(function (x) { return x.id == editId; }); if (h) openForm(h); }
+    if (delId) { const h = hosts.find(function (x) { return x.id == delId; }); if (h) openDelete(h); }
+  });
+  setInterval(load, 30000);
+})();
+</script>
+{% endblock %}

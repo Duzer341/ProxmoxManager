@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Log in - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="card auth-box">
+  <div class="brand"><span class="logo"></span> Proxmox Manager</div>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" action="/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button class="btn primary" type="submit" style="width:100%; justify-content:center">Log in</button>
+  </form>
+</div>
+{% endblock %}

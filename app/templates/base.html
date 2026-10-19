@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Proxmox Manager{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css?v={{ app_version }}">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e57000'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EPM%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+{% if current_user %}
+<header class="topbar">
+  <a class="brand" href="/"><span class="logo"></span> Proxmox Manager</a>
+  <nav class="nav">
+    <a href="/" class="{{ 'active' if page == 'dashboard' else '' }}">Dashboard</a>
+    {% if current_user.is_admin %}
+    <a href="/manage/hosts" class="{{ 'active' if page == 'hosts' else '' }}">Hosts</a>
+    <a href="/manage/users" class="{{ 'active' if page == 'users' else '' }}">Users</a>
+    {% endif %}
+  </nav>
+  <span class="spacer"></span>
+  <div class="user">
+    <a href="/account" title="Account settings">{{ current_user.username }}</a>
+    <span class="badge {{ 'accent' if current_user.is_admin else '' }}">{{ current_user.role }}</span>
+    <form method="post" action="/logout"><button class="btn sm" type="submit">Log out</button></form>
+  </div>
+</header>
+{% endif %}
+<main>
+{% block content %}{% endblock %}
+</main>
+<script src="/static/app.js?v={{ app_version }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

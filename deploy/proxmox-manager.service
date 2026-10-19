@@ -1,0 +1,27 @@
+[Unit]
+Description=Proxmox Manager - multi-host Proxmox VE dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxmox-manager
+Group=proxmox-manager
+WorkingDirectory=/opt/proxmox-manager
+EnvironmentFile=/opt/proxmox-manager/.env
+ExecStart=/opt/proxmox-manager/venv/bin/uvicorn app.main:app --host ${PM_HOST} --port ${PM_PORT} --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/proxmox-manager
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

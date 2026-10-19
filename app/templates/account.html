@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Account - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Account</h1><span class="sub">Signed in as <b>{{ current_user.username }}</b> ({{ current_user.role }})</span></div>
+
+<div class="card" style="max-width:420px">
+  <h2 style="margin:0 0 12px; font-size:15px">Change password</h2>
+  <form id="pw-form" autocomplete="off">
+    <div class="field"><label>Current password</label><input type="password" id="cur" required autocomplete="current-password"></div>
+    <div class="field"><label>New password</label><input type="password" id="new1" required minlength="10" autocomplete="new-password"><div class="hint">At least 10 characters.</div></div>
+    <div class="field"><label>Confirm new password</label><input type="password" id="new2" required autocomplete="new-password"></div>
+    <button class="btn primary" type="submit" id="save">Update password</button>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById("pw-form").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const n1 = document.getElementById("new1").value, n2 = document.getElementById("new2").value;
+  if (n1 !== n2) { PM.toast("New passwords do not match", "bad"); return; }
+  const btn = document.getElementById("save");
+  PM.busy(btn, true, "Saving");
+  try {
+    await PM.api("POST", "/api/me/password", { current_password: document.getElementById("cur").value, new_password: n1 });
+    PM.toast("Password updated", "ok");
+    this.reset();
+  } catch (err) { PM.toast(err.message, "bad"); }
+  PM.busy(btn, false);
+});
+</script>
+{% endblock %}

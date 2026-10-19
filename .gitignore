@@ -1,0 +1,28 @@
+# local config and secrets (install.sh / enable-https.sh create these on the server)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+
+# runtime data: SQLite database (hosts, encrypted credentials, SSH key, users)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

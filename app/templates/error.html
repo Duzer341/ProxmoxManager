@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ status_code }} - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="card auth-box" style="text-align:center">
+  <h1 style="margin:0 0 8px">{{ status_code }}</h1>
+  <p class="muted">{{ detail }}</p>
+  <a class="btn" href="/">Back to dashboard</a>
+</div>
+{% endblock %}

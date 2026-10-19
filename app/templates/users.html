@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Users - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Users</h1>
+  <span class="sub">Admins manage hosts and users. Viewers can see everything and run SMART reads, but cannot change configuration.</span>
+  <div class="actions"><button class="btn primary" id="add">Add user</button></div>
+</div>
+
+<div class="card table-wrap" style="padding:0">
+  <table id="users"><thead><tr>
+    <th>Username</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th></th>
+  </tr></thead><tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
+</div>
+
+<div class="modal-bg" id="user-modal">
+  <div class="modal" style="max-width:460px">
+    <h2 id="modal-title">Add user</h2>
+    <form id="user-form" autocomplete="off">
+      <input type="hidden" id="f-id">
+      <div class="field"><label>Username</label><input type="text" id="f-username" required pattern="[A-Za-z0-9._@\-]+" placeholder="jsmith"></div>
+      <div class="field"><label id="f-pw-label">Password</label><input type="password" id="f-password" autocomplete="new-password"><div class="hint" id="f-pw-hint">At least 10 characters.</div></div>
+      <div class="field"><label>Role</label><select id="f-role"><option value="viewer">Viewer (read-only)</option><option value="admin">Admin</option></select></div>
+      <div class="field inline"><input type="checkbox" id="f-active" checked><label for="f-active">Active (can log in)</label></div>
+      <div class="foot">
+        <button type="button" class="btn" data-close="user-modal">Cancel</button>
+        <button type="submit" class="btn primary" id="save">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const tb = document.querySelector("#users tbody");
+  const ME = {{ current_user.id }};
+  let users = [];
+  const $ = function (id) { return document.getElementById(id); };
+
+  function render() {
+    tb.innerHTML = users.map(function (u) {
+      return '<tr>' +
+        '<td>' + PM.esc(u.username) + (u.id === ME ? ' <span class="muted">(you)</span>' : "") + '</td>' +
+        '<td><span class="badge ' + (u.role === "admin" ? "accent" : "") + '">' + u.role + '</span></td>' +
+        '<td>' + (u.is_active ? '<span class="badge ok">active</span>' : '<span class="badge bad">disabled</span>') + '</td>' +
+        '<td class="muted">' + (u.last_login_at ? PM.when(u.last_login_at) : "never") + '</td>' +
+        '<td class="muted">' + PM.when(u.created_at) + '</td>' +
+        '<td class="right nowrap"><button class="btn sm" data-edit="' + u.id + '">Edit</button> ' + (u.id !== ME ? '<button class="btn sm danger" data-del="' + u.id + '">Delete</button>' : "") + '</td>' +
+      '</tr>';
+    }).join("");
+  }
+
+  async function load() {
+    try { users = await PM.api("GET", "/api/users"); render(); }
+    catch (e) { PM.toast(e.message, "bad"); }
+  }
+
+  function openForm(u) {
+    $("user-form").reset();
+    $("f-id").value = u ? u.id : "";
+    $("modal-title").textContent = u ? "Edit user" : "Add user";
+    $("f-username").value = u ? u.username : "";
+    $("f-password").value = "";
+    $("f-password").required = !u;
+    $("f-pw-label").textContent = u ? "New password" : "Password";
+    $("f-pw-hint").textContent = u ? "Leave blank to keep the current password." : "At least 10 characters.";
+    $("f-role").value = u ? u.role : "viewer";
+    $("f-active").checked = u ? u.is_active : true;
+    PM.openModal("user-modal");
+    $("f-username").focus();
+  }
+
+  $("add").addEventListener("click", function () { openForm(null); });
+
+  tb.addEventListener("click", async function (e) {
+    const edit = e.target.closest("[data-edit]"), del = e.target.closest("[data-del]");
+    if (edit) openForm(users.find(function (x) { return x.id == edit.getAttribute("data-edit"); }));
+    else if (del) {
+      const u = users.find(function (x) { return x.id == del.getAttribute("data-del"); });
+      if (!confirm('Delete user "' + u.username + '"?')) return;
+      try { await PM.api("DELETE", "/api/users/" + u.id); PM.toast("Deleted", "ok"); load(); }
+      catch (err) { PM.toast(err.message, "bad"); }
+    }
+  });
+
+  $("user-form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const id = $("f-id").value, btn = $("save");
+    const body = { username: $("f-username").value.trim(), password: $("f-password").value, role: $("f-role").value, is_active: $("f-active").checked };
+    PM.busy(btn, true, "Saving");
+    try {
+      if (id) await PM.api("PUT", "/api/users/" + id, body); else await PM.api("POST", "/api/users", body);
+      PM.closeModal("user-modal"); PM.toast("Saved", "ok"); load();
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+
+  load();
+})();
+</script>
+{% endblock %}
