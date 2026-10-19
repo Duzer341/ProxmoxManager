@@ -1,495 +1,558 @@
 # Proxmox Manager
 
-A single web dashboard for many Proxmox VE hosts and clusters. Built for an MSP
-that looks after Proxmox boxes at a lot of different clients.
+Proxmox Manager is a self-hosted web application for monitoring and maintaining multiple
+Proxmox VE hosts and clusters from one interface. It polls each host through the Proxmox
+REST API, caches the results in SQLite, and presents version, capacity, update and guest
+state across the whole fleet. Administrators can also run node maintenance (package
+refresh, upgrade, reboot) and basic guest operations (power, console, snapshot, backup,
+disk expansion, start at boot) without opening each host's web UI.
 
-What it shows, per host (or whole cluster):
+The application has no runtime dependency on external CDNs or internet services and can
+run on an isolated management network.
 
-- Reachability, Proxmox VE version (flags clusters whose nodes are on mixed versions), cluster name and quorum
-- CPU, RAM and storage utilisation — current value plus a rolling average (default: last 60 minutes)
-- Nodes online, running / stopped VMs and containers, uptime
-- Full node list with kernel, CPU model, load average, root filesystem
-- Every VM / LXC with status, CPU, RAM, disk, uptime and tags
-- Every storage with usage (shared storage counted once per cluster)
-- Physical disks per node with model, serial, type, size, PVE health and SSD wear
-- **SMART reads on demand** — one disk or every disk on a node, with health, temperature,
-  power-on hours, reallocated / pending sectors and the full attribute table or raw `smartctl` output.
-  Results are stored so the last reading is visible without re-scanning.
-- A one-click **Open PVE web UI** link per host (overridable, e.g. for a VPN-side address)
-- **Pending apt updates** per node (with "includes a kernel" flag) and **reboot pending**
-  detection (newer kernel installed than the one running) straight from the API
-- **Update node** — runs `apt-get update && apt-get dist-upgrade -y` over SSH, streams the
-  output live, tells you whether a reboot is needed and why, with optional auto-reboot
-- **Reboot node** — with a guest-count warning, waits for the node to come back and reports
-  the new kernel
-- A link that opens the node's interactive **upgrade shell** in the PVE web UI as a fallback
-- **Guest actions** (admin): Start / Stop / Restart and Console on every VM and container row,
-  plus *More* with a Start at boot switch, network adapters (bridge / VLAN), snapshot, backup
-  and disk expansion
-- Hover-able CPU / RAM / storage history charts (1 h / 6 h / 24 h)
+## Contents
 
-Plus a fleet summary across everything, filtering / grouping by client, user accounts with
-admin and viewer roles, and a small JSON API.
+- [Features](#features)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Proxmox API access](#proxmox-api-access)
+- [Configuration](#configuration)
+- [HTTPS](#https)
+- [Usage](#usage)
+- [Node maintenance](#node-maintenance)
+- [Guest operations](#guest-operations)
+- [SSH integration (optional)](#ssh-integration-optional)
+- [Security](#security)
+- [API reference](#api-reference)
+- [Project layout](#project-layout)
+- [Roadmap](#roadmap)
 
-Stack: Python 3.11+, FastAPI, [proxmoxer](https://github.com/proxmoxer/proxmoxer), SQLAlchemy +
-SQLite, vanilla HTML/JS. No CDN or internet dependency at runtime, so it works on isolated
-management networks.
+## Features
 
----
+**Monitoring**
 
-## 1. Install (Debian 12 / Ubuntu 22.04+ VM or LXC)
+- Reachability, Proxmox VE version (mixed versions within a cluster are flagged), cluster
+  name and quorum state
+- CPU, memory and storage utilization with current value and rolling average (default
+  window 60 minutes), plus 1 h / 6 h / 24 h history charts
+- Node inventory: kernel, CPU model, load average, root filesystem, uptime
+- Guest inventory: every VM and LXC container with status, CPU, memory, disk, uptime and tags
+- Storage inventory with usage; shared storage is counted once per cluster
+- Physical disks per node (model, serial, type, size, Proxmox health, SSD wear) and on-demand
+  SMART reads with stored results
+- Pending apt updates per node, kernel updates flagged, and reboot-pending detection
+  (installed kernel newer than the running kernel)
+- Detection of enterprise repositories configured without a subscription
+- Fleet summary with grouping by client, sorting and free-text filtering
 
-An unprivileged LXC with 1 vCPU, 512 MB RAM and 4 GB disk is plenty.
+**Node maintenance** (admin)
+
+- Package list refresh and node reboot through the Proxmox API
+- Interactive upgrade shell (`pveupgrade`) opened in the browser with automatic `root@pam` sign-in
+- Optional SSH mode: unattended `dist-upgrade` with live output, reboot-required analysis and
+  optional automatic reboot
+- One-step switch from enterprise to no-subscription repositories
+
+**Guest operations** (admin)
+
+- Start, clean shutdown, hard stop and restart
+- Browser console (noVNC for VMs, xterm.js for containers)
+- Snapshot, backup (vzdump) and disk expansion
+- Start-at-boot view and toggle, startup order, and network adapter details (bridge, VLAN tag,
+  trunks, MAC, model, firewall, link state)
+
+**Access control**
+
+- Local user accounts with `admin` and `viewer` roles
+- JSON API used by the UI, available to scripts with a session cookie
+
+## Architecture
+
+| Component | Implementation |
+|---|---|
+| Web application | Python 3, FastAPI, Uvicorn, Jinja2 templates, vanilla JavaScript |
+| Proxmox access | `proxmoxer` (REST API, port 8006); `paramiko` for optional SSH |
+| Storage | SQLite (WAL mode) via SQLAlchemy 2 in `/var/lib/proxmox-manager` |
+| Service | systemd unit `proxmox-manager`, dedicated system user |
+| TLS (optional) | nginx reverse proxy configured by `deploy/enable-https.sh` |
+
+A background poller queries every enabled host at a fixed interval (`PM_POLL_INTERVAL`,
+default 60 s, `PM_POLL_WORKERS` hosts in parallel) and stores a summary per host plus
+utilization samples. Page loads and API reads are served from that cache. Maintenance and
+guest operations run as jobs in a worker pool; each job records the requesting user, its
+options, live output and result. Jobs that call the Proxmox API follow the corresponding
+Proxmox task log until the task finishes.
+
+For a cluster, one node is added as the host. The cluster API returns all nodes, guests and
+storage, which are aggregated under that host.
+
+## Requirements
+
+- Debian 12 or Ubuntu 24.04 (VM or LXC container), Python 3.11 or later
+- 1 vCPU, 512 MB RAM and 4 GB disk are sufficient for a typical fleet
+- Network access from the dashboard server to TCP 8006 on every Proxmox host, and TCP 22 if
+  the SSH integration is used
+- Network access from administrators' browsers to TCP 8006 on the hosts for the console and
+  upgrade shell, which connect directly from the browser to the host
+- A Proxmox API token per host or cluster (see [Proxmox API access](#proxmox-api-access))
+
+## Installation
 
 ```bash
-# copy this folder to the box, then:
 cd proxmox-manager
-chmod +x install.sh
-sudo ./install.sh
+sudo bash install.sh
 ```
 
-The installer:
+`install.sh` performs the following steps and can be re-run to upgrade:
 
-1. installs `python3`, `python3-venv`, `rsync`
-2. copies the app to `/opt/proxmox-manager` and creates a venv there
-3. creates a `proxmox-manager` system user and `/var/lib/proxmox-manager` for the SQLite DB
-4. generates `/opt/proxmox-manager/.env` with a random `PM_SECRET_KEY`
-5. prompts you to create the first admin user
-6. installs and starts the `proxmox-manager` systemd service on port 8080
+1. Installs `python3`, `python3-venv`, `python3-pip` and `rsync`.
+2. Copies the application to `/opt/proxmox-manager` (excluding `.git`, `.env`, `venv/` and
+   `data/`) and creates a virtual environment there.
+3. Creates the `proxmox-manager` system user and the data directory `/var/lib/proxmox-manager`.
+4. Generates `/opt/proxmox-manager/.env` with a random `PM_SECRET_KEY` if it does not exist.
+   An existing `.env` is kept.
+5. Prompts for the first administrator account on a new installation.
+6. Installs, enables and starts the `proxmox-manager` systemd service on port 8080.
 
-Then open `http://<server-ip>:8080/`.
+The dashboard is then available at `http://<server-ip>:8080/`. To serve it over HTTPS, see
+[HTTPS](#https).
 
-Re-running `install.sh` upgrades in place and keeps `.env` and the database.
+### Upgrade and rollback
 
-### Upgrading
-
-Copy the new files over the folder you installed from and re-run `sudo ./install.sh`
-(keeps `.env` and the database), or for a quick patch copy the changed files straight
-into `/opt/proxmox-manager/` and `systemctl restart proxmox-manager`.
-
-### Useful commands
+Run `install.sh` from the new release. The configuration and database are preserved, and
+schema additions are applied automatically at startup. To roll back, run `install.sh` from
+the previous release. Confirm the running version with:
 
 ```bash
-journalctl -u proxmox-manager -f                          # logs
-systemctl restart proxmox-manager                         # after editing .env
+curl -s http://127.0.0.1:8080/healthz
+```
+
+### Service administration
+
+```bash
+journalctl -u proxmox-manager -f
+sudo systemctl restart proxmox-manager
 cd /opt/proxmox-manager
-runuser -u proxmox-manager -- venv/bin/python manage.py list-users
-runuser -u proxmox-manager -- venv/bin/python manage.py create-admin <name>
-runuser -u proxmox-manager -- venv/bin/python manage.py reset-password <name>
-runuser -u proxmox-manager -- venv/bin/python manage.py set-role <name> admin|viewer
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py list-users
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py create-admin <username>
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py reset-password <username>
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py set-role <username> admin|viewer
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py disable-user <username>
+sudo runuser -u proxmox-manager -- venv/bin/python manage.py enable-user <username>
 ```
 
-### Running it by hand (dev / testing)
+Restart the service after editing `.env`.
+
+### Development
 
 ```bash
-python3 -m venv venv && . venv/bin/activate
+python3 -m venv venv
+. venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # set PM_SECRET_KEY, and PM_DATA_DIR=./data
+cp .env.example .env    # set PM_SECRET_KEY and PM_DATA_DIR=./data
 python manage.py create-admin admin
-uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
 ```
 
----
+## Proxmox API access
 
-## 2. Give the dashboard access to each Proxmox host
+Users and tokens are cluster-wide, so a cluster needs one token.
 
-Create a read-only user and an API token on each host (or once per cluster — users and
-tokens are cluster-wide).
+### Read-only monitoring token
 
-### Option A: shell (any node, as root)
+On any node, as root:
 
 ```bash
-pveum user add monitor@pve --comment "Proxmox Manager dashboard"
+pveum user add monitor@pve --comment "Proxmox Manager"
 pveum acl modify / --users monitor@pve --roles PVEAuditor
 pveum user token add monitor@pve dashboard --privsep 0
 ```
 
-The last command prints the token secret **once** — copy it.
+The last command prints the token secret once. In the web UI the equivalent is Datacenter →
+Permissions: add the user `monitor` (realm *Proxmox VE authentication server*), add a user
+permission on `/` with role `PVEAuditor`, and add an API token `dashboard` with *Privilege
+Separation* unchecked.
 
-### Option B: web UI
+Add the host in the dashboard with:
 
-1. Datacenter → Permissions → Users → **Add**: user `monitor`, realm `Proxmox VE authentication server`.
-2. Datacenter → Permissions → **Add → User Permission**: path `/`, user `monitor@pve`, role `PVEAuditor`.
-3. Datacenter → Permissions → API Tokens → **Add**: user `monitor@pve`, token ID `dashboard`,
-   **untick Privilege Separation**. Copy the secret from the popup — it is shown only once.
+| Field | Value |
+|---|---|
+| Auth type | API token |
+| Token ID | `monitor@pve!dashboard` |
+| Token secret | the UUID printed by Proxmox |
 
-### Add it in the dashboard
+`PVEAuditor` provides `Sys.Audit`, `VM.Audit` and `Datastore.Audit`, which cover all
+monitoring functions, including SMART reads and reboot-pending detection.
 
-| Field        | Value                                                            |
-|--------------|------------------------------------------------------------------|
-| Auth type    | API token                                                        |
-| Token ID     | `monitor@pve!dashboard` — exactly as the API Tokens page shows it |
-| Token secret | the UUID Proxmox printed                                         |
+### Privilege separation
 
-`PVEAuditor` grants `Sys.Audit` (versions, node status, disks, SMART), `Datastore.Audit`
-and `VM.Audit`: everything the dashboard needs and nothing that can change anything.
-
-### Privilege Separation — the usual gotcha
-
-A token created **with** Privilege Separation (the default in the web UI) has *no*
-permissions of its own, even if the user is root. Proxmox will accept the token and then
-return an empty node list; the dashboard reports this as
-"Authenticated, but the token has no permissions". Either recreate the token with the
-box unticked, or give the token its own ACL:
+A token created with *Privilege Separation* enabled (the web UI default) has no permissions
+of its own. Proxmox authenticates it and returns an empty node list, which the dashboard
+reports as "Authenticated, but the token has no permissions". Either recreate the token
+without privilege separation or grant the token its own ACL:
 
 ```bash
 pveum acl modify / --tokens 'monitor@pve!dashboard' --roles PVEAuditor
 ```
 
-(web UI: Datacenter → Permissions → Add → **API Token Permission**, path `/`, role `PVEAuditor`).
+### Privileges for management functions
 
-Username/password auth is also supported (e.g. `root@pam`, or `monitor@pve` with a
-password set via `pveum passwd monitor@pve`). Tokens are preferred: nothing to expire,
-no 2FA interaction, and you can revoke one host's access with
-`pveum user token remove monitor@pve dashboard`.
+Functions that change state need additional privileges. A `root@pam` token without privilege
+separation has all of them. When a privilege is missing, the job fails with a message that
+names the privilege and path.
 
-### Pending-update counts need Sys.Modify
+| Function | Required privilege |
+|---|---|
+| Monitoring, SMART, reboot-pending | `Sys.Audit`, `VM.Audit`, `Datastore.Audit` |
+| Pending update count, package list refresh, repository switch | `Sys.Modify` |
+| Node reboot through the API | `Sys.PowerMgmt` |
+| Guest start / shutdown / stop / restart | `VM.PowerMgmt` |
+| Start at boot | `VM.Config.Options` |
+| Snapshot | `VM.Snapshot` |
+| Backup | `VM.Backup`, `Datastore.AllocateSpace` on the target storage |
+| Disk expansion | `VM.Config.Disk`, `Datastore.AllocateSpace` on the disk's storage |
+| Upgrade shell, guest console | `root@pam` password (Proxmox does not allow these for API tokens) |
 
-Proxmox gates "list available updates" (`GET /nodes/{node}/apt/update`) behind
-`Sys.Modify`, which `PVEAuditor` does not include. With a plain auditor token the node
-shows **updates: n/a**; everything else still works, and *Check updates* over SSH gives
-the real answer. To get the badge without SSH, add that one privilege:
+To add only the pending-update count to a monitoring token:
 
 ```bash
 pveum role add PVEAuditorUpdates -privs "Sys.Audit,Datastore.Audit,VM.Audit,Sys.Modify"
 pveum acl modify / --users monitor@pve --roles PVEAuditorUpdates
 ```
 
-(`Sys.Modify` is a broad privilege; a root token has it already.)
-Reboot-pending detection only needs `Sys.Audit` and works with any token.
+`Sys.Modify` is a broad privilege; grant it only where required.
 
----
+### Password authentication
 
-## 3. Updating nodes
+Username and password authentication (for example `root@pam`) is also supported. Tokens are
+preferred: they do not expire, are not affected by two-factor authentication, and can be
+revoked per host with `pveum user token remove <user> <token>`.
 
-There are two ways to work, and you can mix them per host.
+### TLS verification
 
-### Without SSH (default)
+Proxmox hosts normally use self-signed certificates, so *Verify SSL* is disabled by default
+for new hosts. Enable it for hosts with a certificate the dashboard server trusts (ACME or an
+internal CA).
 
-Nothing to set up beyond the API token. Per node you get:
+## Configuration
 
-- **Refresh package list**: runs Proxmox's own `apt update` task through the API
-  (`POST /nodes/{node}/apt/update`), streams its log, then lists the pending updates and flags
-  kernel packages. Needs `Sys.Modify`.
-- **Upgrade shell ↗**: opens the node's `pveupgrade` terminal from the Proxmox web UI in a new
-  tab (the same as Node → Updates → Upgrade). This is where the updates get installed. Proxmox
-  only allows this console for a real `root@pam` login (API tokens are refused), so the button
-  signs your browser in first:
-  - hosts added with **username/password as root@pam**: one click, it uses the stored password;
-  - other hosts: it asks for the root password once. Tick *Remember for this host* and it's one
-    click from then on (stored encrypted like the other credentials; *Forget it* under the node
-    list removes it).
+Settings are read from `/opt/proxmox-manager/.env`.
 
-  How it works: the dashboard gets a `root@pam` ticket from the host, and the new tab posts that
-  ticket to the host's own login page (`/api2/html/access/ticket`). Proxmox sets its normal
-  login cookie for that browser (valid 2 hours) and the tab then opens the console. The root
-  password itself never goes to the browser. Accounts with two-factor login can't be signed in
-  this way; log in to the Proxmox UI by hand for those.
+| Variable | Default | Description |
+|---|---|---|
+| `PM_SECRET_KEY` | required | Signs session cookies and derives the credential encryption key. Changing it invalidates all sessions and makes stored credentials unreadable. |
+| `PM_HOST` | `0.0.0.0` | Listen address. Set to `127.0.0.1` when behind nginx. |
+| `PM_PORT` | `8080` | Listen port |
+| `PM_DATA_DIR` | `/var/lib/proxmox-manager` | SQLite database location |
+| `PM_POLL_INTERVAL` | `60` | Seconds between poll cycles |
+| `PM_PVE_TIMEOUT` | `15` | Per-request timeout to a host, seconds |
+| `PM_POLL_WORKERS` | `8` | Hosts polled in parallel |
+| `PM_AVERAGE_WINDOW_MINUTES` | `60` | Window for rolling averages |
+| `PM_SAMPLE_RETENTION_HOURS` | `24` | Retention of utilization samples |
+| `PM_SESSION_COOKIE_SECURE` | `false` | Set to `true` when served over HTTPS |
+| `PM_SESSION_MAX_AGE` | `43200` | Session lifetime, seconds |
+| `PM_INITIAL_ADMIN_USERNAME` / `PM_INITIAL_ADMIN_PASSWORD` | unset | Creates an administrator on first start. Remove after use. |
+| `PM_LOG_LEVEL` | `INFO` | `DEBUG` logs every failed Proxmox call |
 
-  Self-signed certificates: the browser has to accept the host's certificate before Proxmox
-  can set its login cookie (a login sent to an untrusted host just lands on the warning page,
-  which is what caused "Connection failed (Error 401: No ticket)"). The button checks this
-  first. If the certificate isn't accepted yet, the new tab shows the host with the warning;
-  click Advanced → Proceed (Chrome) or Accept the Risk and Continue (Firefox) and the shell
-  opens by itself. Once per browser.
-- **Reboot node**: `POST /nodes/{node}/status command=reboot` through the API, then waits for
-  the node's uptime to reset and reports the kernel it came back on. Needs `Sys.PowerMgmt`.
+## HTTPS
 
-Typical flow: Refresh package list → Upgrade shell ↗ (run the upgrade) → the poller shows
-**reboot pending** if a new kernel was installed → Reboot node.
+`deploy/enable-https.sh` places the application behind nginx and restricts the application
+itself to localhost.
 
-A `root@pam` token without privilege separation has `Sys.Modify` and `Sys.PowerMgmt`. With a
-`PVEAuditor`-only token the jobs fail with a message naming the missing privilege.
+```bash
+cd /opt/proxmox-manager
 
-### With SSH (optional)
+# Self-signed certificate for the server's IP address (interim)
+sudo ./deploy/enable-https.sh --self-signed
 
+# Certificate as PFX / PKCS#12
+sudo ./deploy/enable-https.sh --pfx /path/to/certificate.pfx --name proxmox.example.com
 
+# Certificate as PEM
+sudo ./deploy/enable-https.sh --cert /path/to/cert.pem --chain /path/to/intermediate.pem \
+  --key /path/to/key.pem --name proxmox.example.com
+```
 
-The PVE API has no "run apt" call (the web UI's own Upgrade button just opens a root
-shell), so fully hands-off upgrades need SSH. Enabling SSH on a host adds **Check updates (SSH)**
-and **Update node (SSH)**, and Reboot node then goes over SSH too. Leave it off if you prefer
-the no-SSH flow above.
+The script:
 
-#### One-time: create the dashboard key
+1. Installs nginx if required.
+2. Validates the certificate: key match, coverage of `--name`, expiry and chain. For
+   `--self-signed` it generates an 825-day certificate for the server IP (`--ip` to override)
+   and `--name` if given, and reuses it on later runs while it remains valid.
+3. Stores the certificate and key in `/etc/ssl/proxmox-manager/` (key mode 600).
+4. Writes the nginx site: HTTP redirects to HTTPS, HTTPS proxies to `127.0.0.1:<PM_PORT>`, and
+   the responses carry `X-Frame-Options`, `X-Content-Type-Options` and `Referrer-Policy`
+   headers. HSTS is enabled for named certificates and omitted for self-signed mode.
+5. Verifies `/healthz` through nginx.
+6. Sets `PM_HOST=127.0.0.1` and `PM_SESSION_COOKIE_SECURE=true` in `.env` (a timestamped
+   backup is kept), restarts the service and verifies again.
 
-Hosts → **Dashboard SSH key** → *Generate key*. The dashboard keeps an ed25519 keypair
-(private half encrypted in its database). The card then has three views:
+`--name` is required with `--pfx` or `--cert`, and an internal DNS record for that name must
+point to the server. `--no-lockdown` stops before step 6. `--help` lists all options and the
+commands to revert. `deploy/nginx-proxmox-manager.conf.example` contains the equivalent
+configuration for manual setup. The service trusts `X-Forwarded-*` headers only from
+`127.0.0.1`.
 
-- **Install command**: pick the host in *For host* and you get a ready-to-paste script with the
-  key filled in. Paste it into a root shell on the node (Proxmox web UI → node → Shell). It is
-  safe to run more than once, keeps existing keys, works with Proxmox's
-  `/root/.ssh/authorized_keys → /etc/pve/priv/authorized_keys` symlink, and prints
-  `OK: Proxmox Manager key installed on <hostname>`.
-- **Install from your PC**: the same as a single `ssh root@<host> '...'` command for a Linux/macOS
-  terminal; it asks for that node's root password once.
-- **Public key**: just the key line.
+## Usage
 
-Then click **Enable SSH & test**: the dashboard connects with its key, and only if that works
-turns SSH on for the host (root, port 22). Copy works on plain http too.
+**Dashboard.** Fleet totals followed by one card per host. Cards can be grouped by client,
+sorted by CPU, memory, storage or problems, and filtered by name, client, IP, version or node
+name. The page refreshes from the cache every 30 seconds. *Refresh* polls a single host
+immediately; *Refresh all* starts a full poll cycle.
 
-Proxmox ships with `PermitRootLogin yes` in `/etc/ssh/sshd_config`, so key login as root
-works out of the box. If a client hardened that to `prohibit-password`, keys still work;
-only password auth is blocked.
+**Host page.** Summary tiles, utilization history, one section per node with update and
+reboot-pending status and maintenance actions, followed by the guest table, storage table and
+recent jobs. *Disks / SMART* lists a node's physical disks; *Scan* reads SMART for one disk and
+*Scan all disks* for the whole node. *Details* shows the ATA attribute table or the raw
+`smartctl` output for NVMe and SAS devices. SMART data is read through
+`/nodes/{node}/disks/smart`; SMART self-tests are not available through the API.
 
-#### Per host
+**Hosts** (admin). Add, edit, test, disable and delete hosts. *Web UI link override* sets the
+address used for links to the Proxmox UI when it differs from the address the dashboard
+polls, for example an address reachable over VPN.
 
-Edit the host → tick **SSH access** → auth *Dashboard key* (or paste a private key, or
-a password), user `root`, port `22` → *Test SSH* → Save.
+**Users** (admin). Create users with the `admin` or `viewer` role. Viewers have read access and
+can trigger refreshes and SMART reads; they cannot run jobs or change hosts or users.
 
-Clusters: each node is reached on the IP it reports in cluster status (the corosync
-address). If the dashboard can't reach that network, set **Per-node SSH address
-overrides** (`pve1=10.0.0.11`, one per line).
+## Node maintenance
 
-Host keys are pinned on first use; if a node's key ever changes the job refuses to run
-and says so. After a legitimate reinstall, Edit host → *Forget SSH host keys*.
+### API mode (default)
 
-#### Repository problems (enterprise repo without a subscription)
+Available with an API token only:
 
-A fresh Proxmox install points at the paid **enterprise** repositories. Without a subscription key
-`enterprise.proxmox.com` answers `401 Unauthorized`, so apt only sees the Debian repos and
-every Proxmox package (pve-manager, kernel, ceph) is silently skipped. Check updates, Update node
-and Refresh package list detect this, finish with status **warning** instead of "done", and show
-ready-to-paste commands (matched to the node's Debian release and Ceph version) that disable the
-enterprise repo and add the free no-subscription repos. If the client has a subscription, add the
-key instead (Node → Subscription).
+- **Refresh package list** runs the Proxmox `apt update` task
+  (`POST /nodes/{node}/apt/update`), streams the task log, then lists pending updates with
+  kernel packages flagged.
+- **Upgrade shell** opens the node's `pveupgrade` console from the Proxmox UI in a new tab.
+  Proxmox only permits this console for an interactive `root@pam` session, so the dashboard
+  requests a `root@pam` ticket from the host and the new tab submits it to the host's login
+  endpoint (`/api2/html/access/ticket`). Proxmox then sets its standard authentication
+  cookie (valid for two hours) in that browser and the console opens. The password is used
+  server-side only and is never sent to the browser. For hosts added with `root@pam` password
+  authentication the stored password is used; otherwise the password is requested and can be
+  saved per host (encrypted). Accounts with two-factor authentication are not supported by
+  this sign-in.
+- **Reboot node** issues `POST /nodes/{node}/status command=reboot`, waits for the node's
+  uptime to reset and reports the kernel it booted.
 
-**Switch to no-subscription** (button on nodes flagged *enterprise repo, no subscription*): does
-through the Proxmox API exactly what Node → Updates → Repositories does by hand — disables the
-enabled enterprise entries (PVE and Ceph), adds the No-Subscription repo and the matching Ceph
-no-subscription repo, then refreshes the package lists. No SSH needed; the token needs
-`Sys.Modify` (a root@pam token without privilege separation has it). Safe to run twice.
+The browser must already trust the host's certificate before Proxmox can set the
+authentication cookie. The dashboard checks this before signing in; if the certificate has
+not been accepted, the new tab shows the browser's certificate warning, and the console
+opens once the warning is accepted.
 
-#### What Update node (SSH) actually does
+Typical sequence: Refresh package list, Upgrade shell (run the upgrade), wait for the next
+poll to show *reboot pending* if a new kernel was installed, then Reboot node.
 
-1. Checks apt/dpkg are not already locked.
-2. Starts, **detached on the node** (`setsid` + `nohup`, log in `/var/log/proxmox-manager/`):
+### Repository check
+
+A default installation uses the enterprise repositories. Without a subscription,
+`enterprise.proxmox.com` returns `401 Unauthorized` and apt silently skips all Proxmox
+packages. Package refresh, update checks and upgrades detect this, finish with status
+*warning*, and show the commands to switch to the no-subscription repositories for the node's
+Debian release and Ceph version. **Switch to no-subscription** performs the same change
+through the API (as in Node → Updates → Repositories): it disables the enterprise entries
+for PVE and Ceph, adds the matching no-subscription repositories and refreshes the package
+lists. Requires `Sys.Modify`. If the client has a subscription, install the key instead.
+
+### SSH mode
+
+The Proxmox API has no call that installs packages. Enabling SSH for a host adds **Check
+updates (SSH)** and **Update node (SSH)**, and node reboots are then performed over SSH. See
+[SSH integration](#ssh-integration-optional) for setup.
+
+**Update node (SSH)**:
+
+1. Verifies that apt and dpkg are not locked.
+2. Starts the upgrade detached on the node (`setsid`, `nohup`, log in
+   `/var/log/proxmox-manager/`) with `DEBIAN_FRONTEND=noninteractive`:
    ```
    apt-get update
    apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
    apt-get -y autoremove
    ```
-   with `DEBIAN_FRONTEND=noninteractive`, so a package prompt can never hang it and an SSH
-   drop (sshd itself may be upgraded) cannot kill it. The dashboard tails the log and
-   reconnects if needed.
-3. Afterwards checks `/var/run/reboot-required` and compares the running kernel with the
-   newest installed `proxmox-kernel-*` package, then reports **Reboot required** with the
-   reason, or **No reboot required**.
-4. Reboots only if you ticked *Reboot automatically afterwards* and it was required.
+   The dashboard tails the log and reconnects if the SSH session drops, for example when
+   `openssh-server` itself is upgraded.
+3. Evaluates `/var/run/reboot-required` and compares the running kernel with the newest
+   installed `proxmox-kernel-*` package, then reports whether a reboot is required and why.
+4. Reboots only if *Reboot automatically afterwards* was selected and a reboot is required.
 
-`dist-upgrade` is what Proxmox's own `pveupgrade` runs; plain `apt upgrade` can leave a
-PVE system half-updated.
+`dist-upgrade` matches what `pveupgrade` runs; `apt upgrade` can leave a Proxmox system
+partially updated. **Check updates (SSH)** runs `apt-get update` and a simulated
+`dist-upgrade`. **Reboot node (SSH)** runs `systemctl reboot` and waits up to 20 minutes for the
+node to return.
 
-**Check updates** does `apt-get update` plus a simulated dist-upgrade and lists what
-would change, flagging kernel packages. **Reboot node** issues `systemctl reboot`, waits
-for SSH to go away and come back (up to 20 min), and reports the new kernel. Every guest on
-that node stops (or is migrated first if it is HA-managed) — the confirm dialog shows how
-many are running. Jobs are one-at-a-time per node, admin-only, require typing the node
-name, and are listed under *Recent jobs* with their full output.
+All node jobs are restricted to administrators, require the node name to be typed for upgrades
+and reboots, run one at a time per node, and are kept with full output under *Recent jobs*.
+The reboot confirmation shows how many guests are running on the node.
 
-The **Upgrade shell ↗** button opens `https://<host>:8006/?console=upgrade&node=<node>&xtermjs=1`
-after signing the browser in as `root@pam` (see above). Viewers get a plain link and need their
-own Proxmox login.
+## Guest operations
 
-Clusters: add any one node. The API returns the whole cluster — all nodes, guests
-and storage are collected and aggregated. If that node goes down the host shows an
-error until it is back; add a second node as a separate entry if you want redundancy.
+Each row in the guest table provides, for administrators:
 
-SSL: most PVE hosts use self-signed certificates, so **Verify SSL** is off by default.
-Turn it on for hosts with a proper certificate (ACME in Datacenter → ACME, or a CA
-cert the dashboard server trusts).
+| Action | Behavior |
+|---|---|
+| Start | Starts the guest. |
+| Stop | *Shut down cleanly* sends a shutdown with a 180-second timeout, optionally followed by a forced stop. *Power off now* performs a hard stop and requires the VMID to be typed. |
+| Restart | Clean reboot after confirmation. Pending configuration changes are applied. |
+| Console | Signs the browser in as `root@pam` (same mechanism and saved password as the upgrade shell) and opens noVNC (VMs) or xterm.js (containers). Not shown for templates or stopped containers. |
+| More | Opens the dialog described below. |
 
-Network: the dashboard server needs TCP 8006 to each host. Everything else is pull-only.
+The **More** dialog reads the guest configuration live and contains:
 
----
+- **Boot and network.** Start at boot state with a *Turn on* / *Turn off* control, startup
+  order and delays (read only), and one row per network adapter with bridge, VLAN tag or
+  *untagged* (with trunks), MAC address, model, firewall flag and link state. Containers also
+  show the configured IP address and gateway. VM IP addresses are not part of the configuration
+  and are not shown. The start-at-boot change is sent with the configuration digest, so it is
+  rejected if the configuration was modified concurrently; the guest is not restarted.
+- **Snapshot.** Name (default `pm-YYYYMMDD-HHMM`), description, and optional RAM state for
+  running VMs. Rollback and deletion remain in the Proxmox UI.
+- **Backup.** Target storage (storages on the node that accept backups), mode (snapshot,
+  suspend, stop), compression (not applicable to Proxmox Backup Server) and notes template
+  (default `{{guestname}}`).
+- **Expand disk.** Lists VM disks (excluding CD-ROM, EFI and TPM volumes) and container root
+  and volume mount points (excluding bind mounts). Disks can only be grown. For VMs, the
+  partition and filesystem must be extended inside the guest afterwards; for containers
+  Proxmox grows the filesystem.
 
-## 4. Using it
+Templates offer only the More dialog. Every operation runs as a job through the Proxmox API,
+follows the Proxmox task log, and is recorded with the requesting user. One job per guest runs
+at a time, a node reboot waits for running guest jobs on that node, and guest jobs are refused
+while the node is rebooting. Viewers see a direct console link and must sign in to Proxmox
+themselves.
 
-**Dashboard** — fleet tiles at the top, one card per host below. Group by client, sort by
-CPU / RAM / storage / problems, and filter by any text (name, client, IP, version, node
-name). Cards refresh every 30 s from the cache; the background poller hits each host
-every `PM_POLL_INTERVAL` seconds (default 60). *Refresh* polls one host immediately;
-*Refresh all* kicks off a full cycle. The small tick on each bar marks the rolling average.
+## SSH integration (optional)
 
-**Host page** — version / cluster / guests / CPU / RAM / storage tiles, history charts
-(hover for the exact value and time; 1 h / 6 h / 24 h), a block per node with update and
-reboot-pending badges and the Check updates / Update node / Reboot node / Upgrade shell
-buttons, then guests and storage tables and recent jobs. *Disks / SMART* on a node lists its
-physical disks; *Scan* reads SMART for one disk, *Scan all disks* does the whole node.
-*Details* opens the full attribute table (ATA) or raw `smartctl` text (NVMe / SAS).
+### Dashboard key
 
-> SMART reads go through the Proxmox API (`/nodes/{node}/disks/smart`), which runs
-> `smartctl` on the node and returns the current health and attributes. Starting a
-> SMART *self-test* (`smartctl -t short`) is not exposed by the API, so that still needs
-> an SSH session; it would be a reasonable v2 feature with per-host SSH keys.
+Hosts → *Dashboard SSH key* → *Generate key* creates an ed25519 key pair; the private key is
+stored encrypted in the database. The card provides:
 
-**Guest actions** (admin, 1.2.9) — each row in the Guests table has:
+- an install script for a root shell on the node (Proxmox UI → node → Shell). It is
+  idempotent, preserves existing keys and handles the
+  `/root/.ssh/authorized_keys → /etc/pve/priv/authorized_keys` link;
+- an equivalent single `ssh root@<host> '...'` command for a Linux or macOS terminal;
+- the public key.
 
-- **Start** — starts the guest straight away.
-- **Stop** — asks how: *Shut down cleanly* (the guest OS gets 3 minutes, optionally powered
-  off if it hasn't finished) or *Power off now* (hard stop; type the guest ID to confirm).
-- **Restart** — clean reboot after one confirmation; pending config changes are applied.
-- **Console ↗** — signs the browser in as root@pam exactly like the Upgrade shell (same saved
-  password) and opens noVNC for VMs or xterm.js for containers in a new tab.
-- **More ▾** — a dialog with:
-  - **Boot and network** (live from the guest config): whether *Start at boot* is on, with a
-    *Turn on* / *Turn off* button (one confirmation, nothing restarts, the change is recorded
-    as a job; refused if the guest's config was changed in Proxmox at the same moment), plus
-    boot order and up/down delays when set (read only), and one row per network adapter with
-    bridge, VLAN tag (or *untagged*, with trunks when set), MAC, model, firewall flag and
-    link state (*down* when Disconnect is ticked). Containers also show the configured
-    IP / gateway (or `dhcp`). VM IPs aren't in the config, so they aren't shown.
-  - **Snapshot**: name (default `pm-YYYYMMDD-HHMM`), optional description, *Include RAM* for a
-    running VM. Rollback and delete stay in the Proxmox web UI.
-  - **Backup**: storage (only storages on that node that take backups), mode
-    (snapshot / suspend / stop), compression (hidden for Proxmox Backup Server), notes
-    (`{{guestname}}` by default).
-  - **Expand disk**: pick a disk (VM disks except CD-ROMs and EFI/TPM, container rootfs and
-    volume mount points, never bind mounts), add N GiB, confirm. Grow only; Proxmox can't
-    shrink disks. For VMs, extend the partition and filesystem inside the guest afterwards;
-    for containers Proxmox grows the filesystem itself.
+*Enable SSH & test* connects with the key and enables SSH for the host only if the connection
+succeeds. Key authentication as root works with the Proxmox default `PermitRootLogin yes` and
+with `prohibit-password`.
 
-Templates only get *More* (backup). Each action runs as a job through the Proxmox API (no
-SSH), follows the Proxmox task log live in the job dialog, and is recorded with the user who
-started it. One job per guest at a time; a node reboot waits for guest jobs on that node.
-Viewers get a plain console link (they log in to Proxmox themselves) and no action buttons.
+### Per-host settings
 
-Privileges the token needs on the Proxmox side: `VM.Audit` (boot and network info, which the
-monitoring token already has), `VM.Config.Options` (Start at boot on/off), `VM.PowerMgmt`
-(start/stop/restart),
-`VM.Snapshot` (snapshot), `VM.Backup` plus `Datastore.AllocateSpace` on the backup storage
-(backup), `VM.Audit` and `VM.Config.Disk` plus `Datastore.AllocateSpace` (expand disk). A
-root@pam token without privilege separation has all of them; with a read-only token the job
-fails with a message naming the missing privilege.
+Edit the host, enable *SSH access*, select *Dashboard key*, a pasted private key or a
+password, set user and port, then *Test SSH* and save.
 
-**Hosts** (admin) — add / edit / delete hosts, test a connection before saving, disable
-polling for a host without deleting it. Credentials are encrypted at rest with a key
-derived from `PM_SECRET_KEY`.
+In a cluster, each node is reached at the address it reports in the cluster status (the
+corosync address). If that network is not reachable from the dashboard, set *Per-node SSH
+address overrides*, one `node=address` entry per line (for example `pve1=10.0.0.11`).
 
-**Users** (admin) — add users as *admin* or *viewer*. Viewers see everything and can run
-SMART reads and refreshes, but cannot change hosts or users.
+Host keys are pinned on first connection. A changed host key stops the job with an error.
+After a legitimate reinstall, use *Forget SSH host keys* on the host.
 
----
+## Security
 
-## 5. HTTPS
+**Stored secrets.** Proxmox token secrets and passwords, SSH private keys and passwords,
+saved `root@pam` console passwords and the dashboard SSH private key are encrypted with Fernet
+using a key derived from `PM_SECRET_KEY`. They are never returned by the API. `.env` is mode
+600 and readable only by the service account.
 
-`deploy/enable-https.sh` puts the dashboard behind nginx with your certificate and locks the
-app to localhost. It needs an internal DNS record for the name the dashboard will be reached
-by (`--name`, e.g. `proxmox.example.com`) pointing at this machine, and the certificate as a
-PFX or as PEM files:
+**User accounts.** Passwords are hashed with bcrypt and must be at least 10 characters.
+Sessions use a signed cookie (`SameSite=Lax`, `Secure` when `PM_SESSION_COOKIE_SECURE=true`).
+State-changing API requests with an `Origin` or `Referer` header from another host are rejected.
 
-```bash
-cd /opt/proxmox-manager
-# no certificate yet: self-signed for this machine's IP (browsers warn once; accept it)
-sudo ./deploy/enable-https.sh --self-signed
-# with the real certificate (switches to https://proxmox.example.com)
-sudo ./deploy/enable-https.sh --pfx /path/to/certificate.pfx --name proxmox.example.com
-# or
-sudo ./deploy/enable-https.sh --cert /path/to/cert.pem --chain /path/to/intermediate.pem --key /path/to/key.pem --name proxmox.example.com
-```
+**Privilege model.** An administrator can act with every credential stored for a host. With a
+`root@pam` token, root password or the dashboard SSH key configured, an administrator account
+is equivalent to root on those hosts. Assign the admin role accordingly and use least-privilege
+tokens where management functions are not needed.
 
-It checks that the key matches, the certificate covers the name and hasn't expired, stores it
-in `/etc/ssl/proxmox-manager/`, writes the nginx site (port 80 redirects to https, port 443
-proxies to `127.0.0.1:8080`, HSTS and anti-framing headers), checks `https://<name>/healthz`
-through nginx, and only then sets `PM_HOST=127.0.0.1` and `PM_SESSION_COOKIE_SECURE=true` in
-`.env` (backup kept next to it) and restarts the service. `--self-signed` makes a certificate
-for the machine's IP (`--ip` to choose it) and `--name` if given, keeps it across re-runs, serves any
-address on 443 and leaves HSTS off so the browser warning can be clicked through; running the
-script later with `--pfx` or `--cert` replaces it. `--name` is required with `--pfx` /
-`--cert` (the certificate must cover it). `--no-lockdown` stops before the `.env` change. `--help` shows the undo commands.
-`deploy/nginx-proxmox-manager.conf.example` is the same site for doing it by hand.
+**Deployment recommendations.** Serve the application over HTTPS, restrict access to the
+management network, and back up `/var/lib/proxmox-manager` together with `.env`; the database
+cannot be decrypted without the original `PM_SECRET_KEY`.
 
-The service only trusts `X-Forwarded-*` headers from `127.0.0.1` (nginx on the same machine).
+**Known limitations.** No multi-factor authentication, no login rate limiting or lockout,
+no server-side session revocation, and no audit log beyond job history. TLS verification to
+Proxmox hosts is disabled by default.
 
----
+## API reference
 
-## 6. JSON API
+All endpoints under `/api/` require a session cookie. Obtain one by posting to `/login`.
 
-Everything the UI uses is under `/api/` and works with the session cookie:
-
-| Method | Path | Who | Purpose |
+| Method | Path | Role | Description |
 |---|---|---|---|
-| GET | `/api/dashboard` | any | fleet summary + per-host summaries and averages |
-| GET | `/api/hosts/{id}` | any | full host detail incl. nodes, guests, storage, history, stored SMART |
-| POST | `/api/hosts/{id}/refresh` | any | poll one host now |
-| POST | `/api/refresh-all` | any | poll everything now (background) |
-| GET | `/api/hosts/{id}/nodes/{node}/disks` | any | physical disks + last SMART per disk |
-| POST | `/api/hosts/{id}/nodes/{node}/smart` | any | `{"devpath": "/dev/sda"}` → SMART read |
-| POST | `/api/hosts/{id}/nodes/{node}/smart/all` | any | SMART read of every disk on the node |
-| POST | `/api/hosts/{id}/nodes/{node}/refresh-packages` | admin | apt update via the PVE API (no SSH) → `{job_id}` |
-| POST | `/api/hosts/{id}/nodes/{node}/api-reboot` | admin | `{"confirm": "<node>"}` → reboot via the PVE API (no SSH) |
-| POST | `/api/hosts/{id}/nodes/{node}/check-updates` | admin | start a check-updates job over SSH → `{job_id}` |
-| POST | `/api/hosts/{id}/nodes/{node}/upgrade` | admin | `{"confirm": "<node>", "auto_reboot": false}` → start upgrade job |
-| POST | `/api/hosts/{id}/nodes/{node}/reboot` | admin | `{"confirm": "<node>"}` → start reboot job |
-| POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/power` | admin | `{"action": "start\|shutdown\|reboot\|stop", "force_stop": false, "confirm": "<vmid for stop>"}` → `{job_id}` |
+| GET | `/api/dashboard` | any | Fleet summary and per-host summaries |
+| GET | `/api/hosts/{id}` | any | Host detail: nodes, guests, storage, history, SMART, active jobs |
+| POST | `/api/hosts/{id}/refresh` | any | Poll one host |
+| POST | `/api/refresh-all` | any | Start a full poll cycle |
+| GET | `/api/hosts/{id}/nodes/{node}/disks` | any | Physical disks with last SMART result |
+| POST | `/api/hosts/{id}/nodes/{node}/smart` | any | `{"devpath": "/dev/sda"}`: read SMART for one disk |
+| POST | `/api/hosts/{id}/nodes/{node}/smart/all` | any | Read SMART for all disks on the node |
+| POST | `/api/hosts/{id}/nodes/{node}/refresh-packages` | admin | Package list refresh through the API → `{job_id}` |
+| POST | `/api/hosts/{id}/nodes/{node}/api-reboot` | admin | `{"confirm": "<node>"}`: reboot through the API → `{job_id}` |
+| POST | `/api/hosts/{id}/nodes/{node}/check-updates` | admin | Update check over SSH → `{job_id}` |
+| POST | `/api/hosts/{id}/nodes/{node}/upgrade` | admin | `{"confirm": "<node>", "auto_reboot": false}`: upgrade over SSH → `{job_id}` |
+| POST | `/api/hosts/{id}/nodes/{node}/reboot` | admin | `{"confirm": "<node>"}`: reboot over SSH → `{job_id}` |
+| POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/power` | admin | `{"action": "start\|shutdown\|reboot\|stop", "force_stop": false, "confirm": "<vmid>"}` → `{job_id}`; `confirm` required for `stop` |
 | POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/snapshot` | admin | `{"snapname": "pre-patch", "description": "", "vmstate": false}` → `{job_id}` |
-| GET | `/api/hosts/{id}/nodes/{node}/backup-storages` | admin | storages on the node that take backups |
+| GET | `/api/hosts/{id}/nodes/{node}/backup-storages` | admin | Storages on the node that accept backups |
 | POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/backup` | admin | `{"storage": "local", "mode": "snapshot", "compress": "zstd", "notes": "{{guestname}}"}` → `{job_id}` |
-| GET | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/details` | admin | `{onboot, startup, nets, disks}`: start at boot, boot order, adapters with bridge / VLAN, expandable disks |
-| POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/onboot` | admin | `{"onboot": true}` → `{job_id}`; Start at boot on/off |
-| GET | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/disks` | admin | disks of the guest that can be expanded |
+| GET | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/details` | admin | `{onboot, startup, nets, disks}` from the live guest configuration |
+| POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/onboot` | admin | `{"onboot": true}` → `{job_id}` |
+| GET | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/disks` | admin | Disks that can be expanded |
 | POST | `/api/hosts/{id}/nodes/{node}/guests/{vmid}/resize` | admin | `{"disk": "scsi0", "add_gb": 10}` → `{job_id}` |
-| POST | `/api/hosts/{id}/console-login` | admin | `{"password": "", "remember": false}` → root@pam ticket + login URL for the Upgrade shell |
-| DELETE | `/api/hosts/{id}/console-login` | admin | forget the saved root password |
-| GET | `/api/jobs/{id}?since=N` | any | job status, result and output (from char N) |
-| GET | `/api/hosts/{id}/jobs` | any | last 50 jobs for the host |
-| GET/POST | `/api/ssh/key`, `/api/ssh/key/generate` | admin | dashboard SSH public key / regenerate |
-| POST | `/api/ssh/test` | admin | test SSH credentials |
-| GET/POST/PUT/DELETE | `/api/hosts[/{id}]` | admin | host CRUD |
-| POST | `/api/hosts/test` | admin | test credentials without saving |
-| GET/POST/PUT/DELETE | `/api/users[/{id}]` | admin | user CRUD |
-| POST | `/api/me/password` | any | change own password |
-| GET | `/healthz` | public | liveness check |
+| POST | `/api/hosts/{id}/console-login` | admin | `{"password": "", "remember": false}`: `root@pam` ticket and login URL for console sign-in |
+| DELETE | `/api/hosts/{id}/console-login` | admin | Delete the saved `root@pam` password |
+| GET | `/api/jobs/{id}?since=N` | any | Job status, result and output from character N |
+| GET | `/api/hosts/{id}/jobs` | any | Last 50 jobs for the host |
+| GET | `/api/ssh/key` | admin | Dashboard SSH public key |
+| POST | `/api/ssh/key/generate` | admin | Generate or replace the dashboard key pair |
+| POST | `/api/ssh/test` | admin | Test SSH credentials |
+| GET, POST, PUT, DELETE | `/api/hosts`, `/api/hosts/{id}` | admin | Host management |
+| POST | `/api/hosts/test` | admin | Test host credentials without saving |
+| GET, POST, PUT, DELETE | `/api/users`, `/api/users/{id}` | admin | User management |
+| POST | `/api/me/password` | any | Change own password |
+| GET | `/healthz` | none | Liveness check, returns the running version |
 
-Scripting example:
+Example:
 
 ```bash
-curl -c jar -s -o /dev/null -d 'username=admin&password=...' http://dash:8080/login
-curl -b jar -s http://dash:8080/api/dashboard | jq '.hosts[] | {name, version: .summary.version, cpu: .summary.cpu_pct}'
+curl -c jar -s -o /dev/null -d 'username=admin&password=...' https://proxmox.example.com/login
+curl -b jar -s https://proxmox.example.com/api/dashboard \
+  | jq '.hosts[] | {name, version: .summary.version, cpu: .summary.cpu_pct}'
 ```
 
----
-
-## 7. Configuration reference (`.env`)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `PM_SECRET_KEY` | *(required)* | signs sessions, encrypts PVE credentials — never change after hosts are added |
-| `PM_HOST` / `PM_PORT` | `0.0.0.0` / `8080` | listen address |
-| `PM_DATA_DIR` | `/var/lib/proxmox-manager` | SQLite location |
-| `PM_POLL_INTERVAL` | `60` | seconds between poll cycles |
-| `PM_PVE_TIMEOUT` | `15` | per-request timeout to a host |
-| `PM_POLL_WORKERS` | `8` | hosts polled in parallel |
-| `PM_AVERAGE_WINDOW_MINUTES` | `60` | window for the "avg" figures |
-| `PM_SAMPLE_RETENTION_HOURS` | `24` | how long samples are kept |
-| `PM_SESSION_COOKIE_SECURE` | `false` | set `true` behind HTTPS |
-| `PM_SESSION_MAX_AGE` | `43200` | login lifetime, seconds |
-| `PM_INITIAL_ADMIN_USERNAME/PASSWORD` | unset | bootstrap admin on first start (remove afterwards) |
-| `PM_LOG_LEVEL` | `INFO` | `DEBUG` to see every PVE call failure |
-
----
-
-## 8. Layout
+## Project layout
 
 ```
 app/
-  main.py        FastAPI app, middleware, startup (poller) and error handling
-  config.py      settings from .env
-  database.py    SQLAlchemy / SQLite
-  models.py      User, ProxmoxHost, StatSample, SmartResult
-  auth.py        bcrypt, sessions, admin/viewer guards
-  crypto.py      Fernet encryption of stored PVE secrets
-  pve.py         proxmoxer wrapper: collect summary, updates/kernel state, disks, SMART
-  poller.py      background polling loop
-  ssh.py         paramiko: dashboard keypair, pinned host keys, connect/run
-  jobs.py        check-updates / upgrade / reboot jobs with live output
-  routers/       auth pages, HTML pages, JSON API
-  templates/     Jinja2 pages
-  static/        app.css, app.js
-deploy/          systemd unit, nginx example
-manage.py        user admin CLI
-install.sh       installer / upgrader
+  main.py         FastAPI application, middleware, startup, error handling
+  config.py       Settings from .env
+  database.py     SQLAlchemy engine and session, schema migration
+  models.py       User, ProxmoxHost, StatSample, SmartResult, SshHostKey, Job, AppSetting
+  auth.py         Password hashing, session handling, role and origin checks
+  crypto.py       Fernet encryption of stored credentials
+  pve.py          Proxmox API client: summaries, updates, disks, SMART, guest configuration
+  poller.py       Background polling
+  ssh.py          SSH key pair, host key pinning, command execution
+  jobs.py         Node and guest jobs with live output
+  routers/        Login, HTML pages, JSON API
+  templates/      Jinja2 templates
+  static/         CSS and JavaScript
+deploy/
+  proxmox-manager.service            systemd unit
+  enable-https.sh                    nginx and TLS setup
+  nginx-proxmox-manager.conf.example nginx site for manual setup
+install.sh        Installer and upgrader
+manage.py         User administration CLI
 ```
 
-Ideas for later: SMART self-tests over SSH (`smartctl -t short`), backup job status,
-alert thresholds with email/Teams webhooks, ZFS pool health, bulk "update all nodes in
-this cluster one at a time".
+## Roadmap
+
+- Multi-factor authentication (TOTP)
+- Login rate limiting and an audit log
+- SMART self-tests over SSH
+- Backup job status per guest
+- Alerting (email, Microsoft Teams webhooks)
+- ZFS pool health
+- Rolling updates across the nodes of a cluster
