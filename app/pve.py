@@ -431,13 +431,18 @@ def test_connection(host: ProxmoxHost, secret: str) -> dict[str, Any]:
 def list_disks(host: ProxmoxHost, node: str) -> list[dict[str, Any]]:
     api = connect(host)
     try:
-        disks = api.nodes(node).disks.list.get(include_partitions=0)
+        # No parameters: partitions are excluded by default ("include-partitions" = 0).
+        # Never pass include_partitions (underscore): Proxmox VE 9.2 rejects it with
+        # "property is not defined in schema".
+        disks = api.nodes(node).disks.list.get() or []
     except ResourceException as exc:
         raise PveError(_describe(exc)) from exc
     except Exception as exc:
         raise PveError(_describe(exc)) from exc
     out = []
     for d in disks:
+        if d.get("parent"):
+            continue  # a partition (only listed when include-partitions is set)
         out.append(
             {
                 "devpath": d.get("devpath", ""),

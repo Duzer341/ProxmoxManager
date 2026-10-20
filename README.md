@@ -49,7 +49,8 @@ run on an isolated management network.
 **Node maintenance** (admin)
 
 - Package list refresh and node reboot through the Proxmox API
-- Interactive upgrade shell (`pveupgrade`) opened in the browser with automatic `root@pam` sign-in
+- Node terminal (root shell, as Node → Shell) and interactive upgrade shell (`pveupgrade`) opened
+  in the browser with automatic `root@pam` sign-in
 - Optional SSH mode: unattended `dist-upgrade` with live output, reboot-required analysis and
   optional automatic reboot
 - One-step switch from enterprise to no-subscription repositories
@@ -212,7 +213,7 @@ names the privilege and path.
 | Snapshot | `VM.Snapshot` |
 | Backup | `VM.Backup`, `Datastore.AllocateSpace` on the target storage |
 | Disk expansion | `VM.Config.Disk`, `Datastore.AllocateSpace` on the disk's storage |
-| Upgrade shell, guest console | `root@pam` password (Proxmox does not allow these for API tokens) |
+| Terminal, upgrade shell, guest console | `root@pam` password (Proxmox does not allow these for API tokens) |
 
 To add only the pending-update count to a monitoring token:
 
@@ -324,6 +325,8 @@ Available with an API token only:
 - **Refresh package list** runs the Proxmox `apt update` task
   (`POST /nodes/{node}/apt/update`), streams the task log, then lists pending updates with
   kernel packages flagged.
+- **Open terminal** opens a root shell on the node from the Proxmox UI in a new tab (the same
+  console as Node → Shell). It uses the sign-in described for the upgrade shell below.
 - **Upgrade shell** opens the node's `pveupgrade` console from the Proxmox UI in a new tab.
   Proxmox only permits this console for an interactive `root@pam` session, so the dashboard
   requests a `root@pam` ticket from the host and the new tab submits it to the host's login
@@ -395,7 +398,7 @@ Each row in the guest table provides, for administrators:
 | Start | Starts the guest. |
 | Stop | *Shut down cleanly* sends a shutdown with a 180-second timeout, optionally followed by a forced stop. *Power off now* performs a hard stop and requires the VMID to be typed. |
 | Restart | Clean reboot after confirmation. Pending configuration changes are applied. |
-| Console | Signs the browser in as `root@pam` (same mechanism and saved password as the upgrade shell) and opens noVNC (VMs) or xterm.js (containers). Not shown for templates or stopped containers. |
+| Console | Signs the browser in as `root@pam` (same mechanism and saved password as the terminal and upgrade shell) and opens noVNC (VMs) or xterm.js (containers). Not shown for templates or stopped containers. |
 | More | Opens the dialog described below. |
 
 The **More** dialog reads the guest configuration live and contains:
