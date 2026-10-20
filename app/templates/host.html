@@ -336,29 +336,31 @@
   function nodeActions(n) {
     if (!n.online) return "";
     const node = PM.esc(n.node);
-    let html = '<button class="btn sm" data-toggle-disks="' + node + '">' + (openNodes[n.node] ? "Hide disks" : "Disks / SMART") + '</button>' +
+    // Upgrade shell turns yellow while the node has pending updates.
+    const pending = n.updates > 0;
+    const upCls = "btn sm" + (pending ? " warn" : "");
+    const pendingTip = pending ? n.updates + " update" + (n.updates === 1 ? "" : "s") + " pending" + (n.updates_kernel ? ", including a kernel" : "") + ". " : "";
+    const disks = '<button class="btn sm" data-toggle-disks="' + node + '">' + (openNodes[n.node] ? "Hide disks" : "Disks / SMART") + '</button>' +
       '<button class="btn sm" data-smart-all="' + node + '" title="Read SMART health and attributes from every disk on this node">Scan all disks</button>';
-    const viewerLinks =
-      '<a class="btn sm primary" href="' + PM.esc(terminalUrl(n.node)) + '" target="_blank" rel="noopener" title="Opens a shell on the node in the Proxmox web UI (log in as root@pam). Same as Node → Shell.">Open terminal ↗</a>' +
-      '<a class="btn sm" href="' + PM.esc(shellUrl(n.node)) + '" target="_blank" rel="noopener" title="Install updates: opens the pveupgrade terminal in the Proxmox web UI (log in as root@pam). Same as Node → Updates → Upgrade.">Upgrade shell ↗</a>';
-    if (IS_ADMIN) {
-      const ssh = data && data.ssh_enabled;
-      const busyId = data && data.active_jobs && data.active_jobs[n.node];
-      const dis = busyId ? ' disabled title="A job is already running on this node"' : "";
-      if (n.repo_warning === "enterprise_no_subscription")
-        html += '<button class="btn sm primary" data-switch-repos="' + node + '"' + dis + ' title="Disable the enterprise repositories and add No-Subscription (same as Node > Updates > Repositories in Proxmox)">Switch to no-subscription</button>';
-      html += '<button class="btn sm" data-refresh-pkgs="' + node + '"' + dis + ' title="Run apt update through the Proxmox API so the pending-update list is current (no SSH)">Refresh package list</button>';
-      if (ssh) {
-        html += '<button class="btn sm" data-check="' + node + '"' + dis + '>Check updates (SSH)</button>' +
-          '<button class="btn sm primary" data-upgrade="' + node + '"' + dis + '>Update node (SSH)</button>';
-      }
-      html += '<button class="btn sm primary" data-terminal="' + node + '" title="Signs this browser in to Proxmox as root@pam and opens a root shell on the node (same as Node → Shell)">Open terminal ↗</button>';
-      html += '<button class="btn sm" data-shell="' + node + '" title="Install updates: signs this browser in to Proxmox as root@pam and opens the pveupgrade terminal (same as Node → Updates → Upgrade)">Upgrade shell ↗</button>';
-      html += '<button class="btn sm danger" data-reboot="' + node + '" data-via="' + (ssh ? "ssh" : "api") + '"' + dis + '>Reboot node</button>';
-      if (busyId) html += '<button class="btn sm" data-job="' + busyId + '"><span class="spin"></span> View job</button>';
-    } else {
-      html += viewerLinks;
+    if (!IS_ADMIN) {
+      return '<a class="btn sm primary" data-terminal-link="' + node + '" href="' + PM.esc(terminalUrl(n.node)) + '" target="_blank" rel="noopener" title="Opens a shell on the node in the Proxmox web UI (log in as root@pam). Same as Node → Shell.">Open terminal ↗</a>' +
+        disks +
+        '<a class="' + upCls + '" data-shell-link="' + node + '" href="' + PM.esc(shellUrl(n.node)) + '" target="_blank" rel="noopener" title="' + PM.esc(pendingTip + "Install updates: opens the pveupgrade terminal in the Proxmox web UI (log in as root@pam). Same as Node → Updates → Upgrade.") + '">Upgrade shell ↗</a>';
     }
+    const ssh = data && data.ssh_enabled;
+    const busyId = data && data.active_jobs && data.active_jobs[n.node];
+    const dis = busyId ? ' disabled title="A job is already running on this node"' : "";
+    let html = '<button class="btn sm primary" data-terminal="' + node + '" title="Signs this browser in to Proxmox as root@pam and opens a root shell on the node (same as Node → Shell)">Open terminal ↗</button>' + disks;
+    if (n.repo_warning === "enterprise_no_subscription")
+      html += '<button class="btn sm primary" data-switch-repos="' + node + '"' + dis + ' title="Disable the enterprise repositories and add No-Subscription (same as Node > Updates > Repositories in Proxmox)">Switch to no-subscription</button>';
+    html += '<button class="btn sm" data-refresh-pkgs="' + node + '"' + dis + ' title="Run apt update through the Proxmox API so the pending-update list is current (no SSH)">Refresh package list</button>';
+    if (ssh) {
+      html += '<button class="btn sm" data-check="' + node + '"' + dis + '>Check updates (SSH)</button>' +
+        '<button class="btn sm primary" data-upgrade="' + node + '"' + dis + '>Update node (SSH)</button>';
+    }
+    html += '<button class="' + upCls + '" data-shell="' + node + '" title="' + PM.esc(pendingTip + "Install updates: signs this browser in to Proxmox as root@pam and opens the pveupgrade terminal (same as Node → Updates → Upgrade)") + '">Upgrade shell ↗</button>';
+    html += '<button class="btn sm danger" data-reboot="' + node + '" data-via="' + (ssh ? "ssh" : "api") + '"' + dis + '>Reboot node</button>';
+    if (busyId) html += '<button class="btn sm" data-job="' + busyId + '"><span class="spin"></span> View job</button>';
     return html;
   }
 

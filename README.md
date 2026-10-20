@@ -327,8 +327,8 @@ Available with an API token only:
   kernel packages flagged.
 - **Open terminal** opens a root shell on the node from the Proxmox UI in a new tab (the same
   console as Node → Shell). It uses the sign-in described for the upgrade shell below.
-- **Upgrade shell** opens the node's `pveupgrade` console from the Proxmox UI in a new tab.
-  Proxmox only permits this console for an interactive `root@pam` session, so the dashboard
+- **Upgrade shell** opens the node's `pveupgrade` console from the Proxmox UI in a new tab. The
+  button is highlighted in yellow while the node has pending updates. Proxmox only permits this console for an interactive `root@pam` session, so the dashboard
   requests a `root@pam` ticket from the host and the new tab submits it to the host's login
   endpoint (`/api2/html/access/ticket`). Proxmox then sets its standard authentication
   cookie (valid for two hours) in that browser and the console opens. The password is used
