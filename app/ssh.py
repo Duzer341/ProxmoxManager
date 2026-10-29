@@ -215,10 +215,31 @@ def run(client: paramiko.SSHClient, cmd: str, timeout: int = 60) -> tuple[int, s
     return rc, b"".join(chunks).decode("utf-8", "replace")
 
 
+class _ProbeHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Test SSH: an address with a pinned host key must still present that key before
+    any password or key is offered; an address seen for the first time is accepted but not pinned
+    (pinning happens at the first real connection of a saved host)."""
+
+    def __init__(self, db: Session, address: str):
+        self.db, self.address = db, address
+
+    def missing_host_key(self, client, hostname, key):  # noqa: D401
+        rows = self.db.query(SshHostKey).filter(SshHostKey.address == self.address).all()
+        if not rows:
+            return
+        if any(r.key_type == key.get_name() and r.key_b64 == key.get_base64() for r in rows):
+            return
+        raise SshError(
+            f"SSH host key for {self.address} has CHANGED: pinned {rows[0].fingerprint}, offered {fingerprint(key)}. "
+            "Nothing was sent. If the node was reinstalled, use 'Forget SSH host keys' on the host first."
+        )
+
+
 def probe(db: Session, address: str, port: int, username: str, auth: str, secret: str) -> dict[str, Any]:
-    """Connectivity + auth check for the host form's 'Test SSH' button. Does not pin host keys."""
+    """Connectivity + auth check for the host form's 'Test SSH' button. Does not pin host keys, but
+    refuses an address whose pinned key changed."""
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.set_missing_host_key_policy(_ProbeHostKeyPolicy(db, address))
     kwargs: dict[str, Any] = dict(
         hostname=address, port=port, username=username or "root", timeout=CONNECT_TIMEOUT,
         banner_timeout=20, auth_timeout=20, allow_agent=False, look_for_keys=False,

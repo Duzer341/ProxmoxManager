@@ -9,7 +9,9 @@ User=proxmox-manager
 Group=proxmox-manager
 WorkingDirectory=/opt/proxmox-manager
 EnvironmentFile=/opt/proxmox-manager/.env
-ExecStart=/opt/proxmox-manager/venv/bin/uvicorn app.main:app --host ${PM_HOST} --port ${PM_PORT} --proxy-headers --forwarded-allow-ips=127.0.0.1
+# --no-access-log: uvicorn's access log would put query strings (e.g. the Entra sign-in code) into
+# the journal. Sign-ins and changes are logged by the app itself (logger app.events).
+ExecStart=/opt/proxmox-manager/venv/bin/uvicorn app.main:app --host ${PM_HOST} --port ${PM_PORT} --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-access-log
 Restart=on-failure
 RestartSec=5
 

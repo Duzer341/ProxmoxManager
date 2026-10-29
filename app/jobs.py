@@ -27,7 +27,7 @@ from proxmoxer.core import ResourceException
 
 from .database import db_session
 from .models import Job, ProxmoxHost
-from .pve import PveError, is_kernel_package, kernel_sort_key
+from .pve import PveError, forget_guest_disks, is_kernel_package, kernel_sort_key, remember_guest_disks
 from .pve import connect as pve_connect
 from .ssh import SshError, connect, node_address, run
 
@@ -66,12 +66,14 @@ def _label(kind: str) -> str:
 
 def start_job(host_id: int, node: str, kind: str, username: str, options: dict | None = None,
               vmid: int | None = None) -> int:
-    """Create a job row and schedule it. Returns the job id.
+    """Create a job row and schedule it. Returns the job id. Raises ValueError for an invalid node name.
 
     Node jobs (vmid None) allow one node job at a time per node. Guest jobs allow one job
     at a time per guest. A node reboot also waits for guest jobs on that node to finish,
     and guest jobs are refused while the node is rebooting.
     """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}", node or ""):
+        raise ValueError(f"Invalid node name: {node[:40]!r}")
     with db_session() as db:
         running = db.query(Job).filter(Job.host_id == host_id, Job.status.in_(ACTIVE))
         if vmid is None:
@@ -138,6 +140,25 @@ class _Ctx:
         return run(self.client, cmd, timeout=timeout)
 
 
+def _log_finished(job: Job, host: ProxmoxHost, options: dict) -> None:
+    """The event log gets the outcome of every job (who started it is the job's requester)."""
+    try:
+        from . import events
+
+        def _utc(d):
+            return d.replace(tzinfo=timezone.utc) if d is not None and d.tzinfo is None else d
+
+        dur = (int((_utc(job.finished_at) - _utc(job.started_at)).total_seconds())
+               if job.started_at and job.finished_at else None)
+        events.event("action", "job.finished", {"done": "ok", "warning": "ok", "failed": "failed"}.get(job.status, "info"),
+                    username=job.requested_by, host_id=job.host_id, host_name=host.name, node=job.node, vmid=job.vmid,
+                    details={"job_id": job.id, "job": job.kind, "status": job.status, "error": (job.error or "")[:300],
+                             "duration_seconds": dur, **{k: options[k] for k in ("action", "snapname", "storage", "disk", "add_gb", "onboot")
+                                                         if k in options}})
+    except Exception:  # noqa: BLE001
+        log.exception("could not log the result of job %s", job.id)
+
+
 def _run_job(job_id: int) -> None:
     with _lock:
         _running.add(job_id)
@@ -201,6 +222,7 @@ def _run_job(job_id: int) -> None:
                     job.status = "warning"
                 else:
                     job.status = "done"
+                _log_finished(job, host, options)
     finally:
         with _lock:
             _running.discard(job_id)
@@ -548,8 +570,10 @@ def _api_guest_resize(ctx: _Ctx) -> dict[str, Any]:
     try:
         cfg = _guest_api(api, ctx.node, gtype, vmid).config.get() or {}
         after = next((x.split("=", 1)[1] for x in str(cfg.get(disk, "")).split(",") if x.startswith("size=")), "")
+        remember_guest_disks(ctx.host.id, ctx.node, gtype, vmid, cfg)   # the re-poll below shows the new size
     except Exception:  # noqa: BLE001
-        pass
+        forget_guest_disks(ctx.host.id, vmid)
+    _repoll(ctx)
     ctx.log(f"Done. {disk} is now {after or 'larger'}" + (f" (was {before})." if before else "."))
     if gtype == "qemu":
         ctx.log("Proxmox only grows the virtual disk. Extend the partition and filesystem inside the guest: "

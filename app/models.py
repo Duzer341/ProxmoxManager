@@ -18,14 +18,70 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False, default="viewer")  # admin | viewer
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="viewer")  # admin | technician | viewer
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # local = username/password (optionally with TOTP); entra = Microsoft Entra ID sign-in.
+    auth_source: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
+    # Entra: immutable object id (oid claim) and tenant id; the account is matched on these.
+    entra_oid: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    entra_tid: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+
+    # TOTP (authenticator app). Secrets are Fernet-encrypted; recovery codes are SHA-256 hashes.
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    mfa_secret_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    mfa_pending_secret_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    mfa_last_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # replay protection
+    mfa_recovery_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    mfa_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # random key also stored in the session cookie. Changing it signs the user out of every
+    # browser (password / authenticator reset, role change, disable). A deleted user's cookie can't
+    # authenticate as a new user who later gets the same id.
+    session_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+
+    # one-time code an admin gives a privileged user for the first authenticator setup
+    enroll_code_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    enroll_code_expires: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # the password was set by an administrator (new account or reset); the user sets
+    # their own at the next sign-in, after the authenticator step, before the session starts.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # colour theme, stored on the account so it follows the user to any browser.
+    theme: Mapped[str] = mapped_column(String(8), nullable=False, default="dark")  # dark | light | system
+
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    def rotate_session_key(self) -> None:
+        import secrets
+
+        self.session_key = secrets.token_hex(16)
+
+    @property
+    def is_technician(self) -> bool:
+        return self.role == "technician"
+
+    def can(self, cap: str) -> bool:
+        """Role permission check (app/permissions.py is the single source of truth)."""
+        from .permissions import role_can
+
+        return bool(self.is_active) and role_can(self.role, cap)
+
+    @property
+    def caps(self) -> list[str]:
+        from .permissions import caps_for
+
+        return caps_for(self.role) if self.is_active else []
+
+    @property
+    def is_sso(self) -> bool:
+        return self.auth_source == "entra"
 
 
 class ProxmoxHost(Base):
@@ -41,6 +97,8 @@ class ProxmoxHost(Base):
     # Optional override for the clickable web UI link (e.g. a VPN-side address).
     web_url: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     verify_ssl: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # SHA-256 of the pinned certificate when verify_ssl is off ("" = pin on first use)
+    tls_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
     auth_type: Mapped[str] = mapped_column(String(16), nullable=False, default="token")  # token | password
     # For token auth: user = "monitor@pve", token_name = "dashboard", secret = token value
@@ -63,6 +121,8 @@ class ProxmoxHost(Base):
     # Optional per-node SSH address overrides, JSON {"node": "ip-or-dns"}; otherwise the
     # cluster-reported node IP is used, or the host address for single nodes.
     ssh_node_addrs: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # optional friendly name per cluster node, JSON {"node": "name"} (host page, console titles)
+    node_names: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Optional root@pam password used only to sign the browser in to the PVE web UI
     # (Upgrade shell). Fernet-encrypted; empty = ask each time.
     console_secret_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -170,3 +230,50 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class RevokedSession(Base):
+    """A browser sign-in that was signed out. Session cookies are signed, not stored, so
+    signing out records the sign-in's random id here; the cookie is refused from then on even if
+    someone kept a copy. Rows are pruned after PM_SESSION_MAX_AGE."""
+
+    __tablename__ = "revoked_sessions"
+
+    sid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ConsoleLog(Base):
+    """One console session through the relay: who, what, when, how much."""
+
+    __tablename__ = "console_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    host_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    host_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    node: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    vmid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # vm | ct | shell | upgrade
+    label: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+    client_ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_reason: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    bytes_to_host: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    bytes_from_host: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # how the console re-auth was done (totp / entra)
+    stepup_method: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+
+
+def node_names_of(host) -> dict[str, str]:
+    """A host's per-node friendly names ({} when none or unreadable)."""
+    import json
+
+    try:
+        d = json.loads(getattr(host, "node_names", "") or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in d.items() if v} if isinstance(d, dict) else {}

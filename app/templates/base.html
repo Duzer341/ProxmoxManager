@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{{ theme or 'dark' }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -20,13 +20,15 @@
   </nav>
   <span class="spacer"></span>
   <div class="user">
+    {% if current_user.can("console") %}<span class="badge ok" id="stepup-badge" style="display:none" title="You verified recently: consoles can be opened from this browser until this runs out. It doesn't extend with use.">Console access · <span class="t"></span> <button class="btn sm link" id="stepup-drop" type="button" title="End console access now">End</button></span>{% endif %}
     <a href="/account" title="Account settings">{{ current_user.username }}</a>
-    <span class="badge {{ 'accent' if current_user.is_admin else '' }}">{{ current_user.role }}</span>
+    <span class="badge {{ 'accent' if current_user.is_admin else ('info' if current_user.is_technician else '') }}">{{ current_user.role }}</span>
     <form method="post" action="/logout"><button class="btn sm" type="submit">Log out</button></form>
   </div>
 </header>
 {% endif %}
 <main>
+{% if notice %}<div class="card notice warn-text" id="notice">{{ notice }}</div>{% endif %}
 {% block content %}{% endblock %}
 </main>
 <script src="/static/app.js?v={{ app_version }}"></script>

@@ -67,6 +67,31 @@ def prune_samples() -> None:
         db.execute(delete(StatSample).where(StatSample.ts < cutoff))
 
 
+MAINTENANCE_SECONDS = 6 * 3600
+_last_maintenance = [0.0]
+
+
+def maintenance(force: bool = False) -> dict | None:
+    """Retention, at most every 6 hours: console log rows older than PM_CONSOLE_LOG_RETENTION_DAYS
+    and expired session revocations."""
+    import time as _time
+
+    from . import events, sessions
+    from .models import ConsoleLog
+
+    if not force and _time.time() - _last_maintenance[0] < MAINTENANCE_SECONDS:
+        return None
+    _last_maintenance[0] = _time.time()
+    out = {"revoked_sessions_pruned": sessions.prune()}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, settings.CONSOLE_LOG_RETENTION_DAYS))
+    with db_session() as db:
+        out["console_log"] = db.query(ConsoleLog).filter(ConsoleLog.created_at < cutoff).delete()
+    if out["console_log"]:
+        events.event("system", "console_log.prune", "info", details={"removed": out["console_log"],
+                                                                     "older_than_days": settings.CONSOLE_LOG_RETENTION_DAYS})
+    return out
+
+
 class Poller:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
@@ -106,9 +131,13 @@ class Poller:
     async def _poll_all(self) -> None:
         with db_session() as db:
             ids = [h.id for h in db.query(ProxmoxHost).filter_by(enabled=True).all()]
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self._executor, maintenance)
+        except Exception:  # noqa: BLE001
+            log.exception("audit / console log retention failed")
         if not ids:
             return
-        loop = asyncio.get_running_loop()
         await asyncio.gather(*(self.poll_one_now(i) for i in ids), return_exceptions=True)
         await loop.run_in_executor(self._executor, prune_samples)
 

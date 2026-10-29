@@ -13,10 +13,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .. import crypto, jobs, ssh
+import logging
+
+from .. import crypto, jobs, loginconfig, mfa, ssh, tlspin
+from .. import permissions as perms
+from ..events import note_current
 from ..auth import (
     hash_password,
     require_admin,
+    require_cap,
     require_same_origin,
     require_user,
     validate_password_strength,
@@ -24,21 +29,32 @@ from ..auth import (
 )
 from ..config import settings
 from ..database import get_db
-from ..models import Job, ProxmoxHost, SmartResult, StatSample, User
+from ..models import Job, ProxmoxHost, SmartResult, StatSample, User, node_names_of
 from ..poller import poller
+from ..templating import clean_theme, theme_cookie
 from ..pve import (
-    ConsoleAuthError,
     PveError,
-    console_ticket,
     guest_details,
     guest_disks,
     list_backup_storages,
+    forget_guest_disks,
     list_disks,
+    node_network,
     read_smart,
     test_connection,
 )
 
-router = APIRouter(prefix="/api", dependencies=[Depends(require_same_origin)])
+_NODE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")   # used with fullmatch
+
+
+def _node_param_ok(request: Request) -> None:
+    """a node name in the URL must look like one before it reaches a Proxmox API path."""
+    node = request.path_params.get("node")
+    if node is not None and not _NODE_NAME_RE.fullmatch(node):
+        raise HTTPException(404, "Unknown node")
+
+
+router = APIRouter(prefix="/api", dependencies=[Depends(require_same_origin), Depends(_node_param_ok)])
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +127,7 @@ def _host_public(host: ProxmoxHost, include_config: bool = False) -> dict:
         "last_ok_at": _iso(host.last_ok_at),
         "last_error": host.last_error,
         "console_login": _console_source(host),
+        "node_names": node_names_of(host),
     }
     if include_config:
         data.update(
@@ -127,6 +144,8 @@ def _host_public(host: ProxmoxHost, include_config: bool = False) -> dict:
                 "ssh_auth": host.ssh_auth,
                 "ssh_has_secret": bool(host.ssh_secret_enc),
                 "ssh_node_addrs": _node_addrs_text(host.ssh_node_addrs),
+                "tls_mode": "ca" if host.verify_ssl else ("pinned" if host.tls_fingerprint else "pending"),
+                "tls_fingerprint": "" if host.verify_ssl else tlspin.pretty(host.tls_fingerprint),
                 "nodes": [n.get("node") for n in (_summary(host) or {}).get("nodes", []) if n.get("node")],
             }
         )
@@ -171,6 +190,7 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_user))
         "nodes_online": 0,
         "guests_running": 0,
         "guests_stopped": 0,
+        "guests_unknown": 0,
         "cores": 0,
         "cpu_weighted": 0.0,
         "mem_used": 0,
@@ -212,6 +232,7 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_user))
                 fleet["nodes_online"] += s["nodes_online"]
                 fleet["guests_running"] += s["guests_running"]
                 fleet["guests_stopped"] += s["guests_stopped"]
+                fleet["guests_unknown"] += s.get("guests_unknown", 0)
                 fleet["cores"] += s["cores"]
                 fleet["cpu_weighted"] += s["cpu_pct"] * s["cores"]
                 fleet["mem_used"] += s["mem_used"]
@@ -273,6 +294,22 @@ def _node_addrs_text(js: str) -> str:
         return ""
 
 
+def _clean_node_names(d: dict) -> dict[str, str]:
+    """Validate {"node": "friendly name"}: real node names, names up to 64 printable characters, blanks dropped."""
+    if len(d) > 64:
+        raise HTTPException(400, "Too many node names (64 at most).")
+    out = {}
+    for k, v in d.items():
+        k, v = str(k).strip(), " ".join(str(v or "").split())
+        if not _NODE_NAME_RE.fullmatch(k):
+            raise HTTPException(400, f"'{k[:40]}' is not a valid node name.")
+        if len(v) > 64:
+            raise HTTPException(400, f"The name for {k} is longer than 64 characters.")
+        if v:
+            out[k] = v
+    return dict(sorted(out.items()))
+
+
 class HostIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     client: str = Field(default="", max_length=128)
@@ -296,6 +333,9 @@ class HostIn(BaseModel):
     ssh_auth: Literal["appkey", "key", "password"] = "appkey"
     ssh_secret: str = Field(default="", max_length=16000)  # pasted private key or password; blank on edit = keep
     ssh_node_addrs: str = Field(default="", max_length=4000)  # "node=address" per line
+    node_names: dict[str, str] | None = None   # {"node": "friendly name"}; None = leave unchanged
+    # the certificate fingerprint shown by "Test connection", pinned on save
+    tls_fingerprint: str = Field(default="", max_length=100)
 
     def validate_auth(self, editing: bool) -> None:
         """Normalise and validate the credential fields. Mutates pve_user / token_name."""
@@ -308,6 +348,8 @@ class HostIn(BaseModel):
         if self.ssh_enabled and self.ssh_auth == "key" and self.ssh_secret and "PRIVATE KEY" not in self.ssh_secret:
             raise HTTPException(400, "That does not look like a private key (expected a -----BEGIN ... PRIVATE KEY----- block)")
         self.ssh_node_addrs = _parse_node_addrs(self.ssh_node_addrs)
+        if self.node_names is not None:
+            self.node_names = _clean_node_names(self.node_names)
 
         if self.auth_type == "token":
             # Accept the Token ID in either field; people paste "root@pam!name" where the user goes.
@@ -370,10 +412,14 @@ async def hosts_create(body: HostIn, db: Session = Depends(get_db), user: User =
         ssh_auth=body.ssh_auth,
         ssh_secret_enc=crypto.encrypt(body.ssh_secret) if body.ssh_secret else "",
         ssh_node_addrs=body.ssh_node_addrs,
+        node_names=json.dumps(body.node_names) if body.node_names else "",
+        tls_fingerprint="" if body.verify_ssl else tlspin.normalize(body.tls_fingerprint),
     )
     db.add(host)
     db.commit()
     db.refresh(host)
+    note_current(action="host.create", host_name=host.name, details={"host_id": host.id, "address": f"{host.host}:{host.port}",
+                 "auth_type": host.auth_type, "ssh_enabled": host.ssh_enabled, "verify_ssl": host.verify_ssl})
     if host.enabled:
         asyncio.create_task(poller.poll_one_now(host.id))
     return _host_public(host, include_config=True)
@@ -423,6 +469,23 @@ async def hosts_update(
 ):
     body.validate_auth(editing=True)
     host = _get_host(db, host_id)
+    _before = {k: getattr(host, k) for k in _HOST_AUDIT_FIELDS}
+    _old_name = host.name
+    _old_target = (host.host.strip().lower(), host.port, host.verify_ssl)
+    new_target = (body.host.strip().lower(), body.port, body.verify_ssl)
+    same_machine = new_target == _old_target
+    if not same_machine and not body.verify_ssl and not _old_target[2] and host.tls_fingerprint:
+        # A renumbered host (new address, same pinned certificate) keeps its saved secrets.
+        try:
+            same_machine = await asyncio.to_thread(tlspin.fetch, body.host.strip(), body.port, 10) == \
+                tlspin.normalize(host.tls_fingerprint)
+        except Exception:  # noqa: BLE001
+            same_machine = False
+    if not same_machine and not body.secret:
+        # the saved token / password is only sent to the machine it was saved for
+        raise HTTPException(400, "The address, port or certificate check changed and the new address doesn't present "
+                                 "this host's pinned certificate, so the saved API token secret / password isn't sent "
+                                 "there. Enter it again to save these settings.")
     host.name = body.name.strip()
     host.client = body.client.strip()
     host.host = body.host.strip()
@@ -443,13 +506,34 @@ async def hosts_update(
     if body.ssh_secret:
         host.ssh_secret_enc = crypto.encrypt(body.ssh_secret)
     host.ssh_node_addrs = body.ssh_node_addrs
+    if body.node_names is not None:
+        host.node_names = json.dumps(body.node_names) if body.node_names else ""
+    if new_target != _old_target and not same_machine:
+        # a different machine gets a new pin (the one the admin just tested, else pinned on
+        # first use at the next poll) and the saved root@pam console password is not sent to it
+        host.tls_fingerprint = "" if host.verify_ssl else tlspin.normalize(body.tls_fingerprint)
+        host.console_secret_enc = ""
     if not host.enabled:
         host.last_error = ""
     db.commit()
     db.refresh(host)
+    changed = [k for k in _HOST_AUDIT_FIELDS if getattr(host, k) != _before[k]]
+    if body.secret:
+        changed.append("api secret / password (value not recorded)")
+    if body.ssh_secret:
+        changed.append("ssh key / password (value not recorded)")
+    note_current(action="host.update", host_name=_old_name,
+                 details={"changed": changed, **({"renamed_to": host.name} if host.name != _old_name else {})})
+    if body.secret or any(k in changed for k in ("host", "port", "auth_type", "pve_user", "token_name")):
+        forget_guest_disks(host.id)   # it may point at different guests now
     if host.enabled:
         asyncio.create_task(poller.poll_one_now(host.id))
     return _host_public(host, include_config=True)
+
+
+_HOST_AUDIT_FIELDS = ("name", "client", "host", "port", "web_url", "verify_ssl", "auth_type", "pve_user", "token_name",
+                      "enabled", "notes", "ssh_enabled", "ssh_user", "ssh_port", "ssh_auth", "ssh_node_addrs", "node_names",
+                      "tls_fingerprint")
 
 
 @router.delete("/hosts/{host_id}", status_code=204)
@@ -458,8 +542,10 @@ def hosts_delete(host_id: int, db: Session = Depends(get_db), user: User = Depen
     active = db.query(Job).filter(Job.host_id == host.id, Job.status.in_(("queued", "running"))).first()
     if active:
         raise HTTPException(409, f"Job #{active.id} ({active.kind.replace('_', ' ')}) is still running on {active.node}. Wait for it to finish before deleting the host.")
+    note_current(action="host.delete", host_name=host.name, details={"address": f"{host.host}:{host.port}"})
     db.delete(host)
     db.commit()
+    forget_guest_disks(host_id)
     return None
 
 
@@ -471,8 +557,16 @@ class TestIn(HostIn):
 async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     body.validate_auth(editing=body.host_id is not None)
     secret = body.secret
-    if not secret and body.host_id is not None:
-        existing = _get_host(db, body.host_id)
+    existing = _get_host(db, body.host_id) if body.host_id is not None else None
+    same_target = (existing is not None and body.host.strip().lower() == existing.host.strip().lower()
+                   and body.port == existing.port and body.verify_ssl == existing.verify_ssl)
+    if not secret and existing is not None:
+        # the stored secret is only ever sent to the stored host and account
+        if not (same_target and body.auth_type == existing.auth_type and body.pve_user.strip() == existing.pve_user
+                and (body.auth_type != "token" or body.token_name.strip() == existing.token_name)):
+            note_current(details={"refused": "stored secret not reused for a different address or account"})
+            return {"ok": False, "error": "The address or account differs from the saved host, so the saved "
+                                          "token / password is not sent. Enter it to test these settings."}
         secret = crypto.decrypt(existing.secret_enc)
     probe = ProxmoxHost(
         name=body.name,
@@ -483,6 +577,7 @@ async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = D
         pve_user=body.pve_user.strip(),
         token_name=body.token_name.strip(),
         secret_enc="",
+        tls_fingerprint=(existing.tls_fingerprint if same_target and existing.verify_ssl == body.verify_ssl else ""),
     )
     loop = asyncio.get_running_loop()
     try:
@@ -492,6 +587,57 @@ async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = D
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, **result}
+
+
+# --------------------------------------------------------------------------- #
+# TLS pin
+# --------------------------------------------------------------------------- #
+
+@router.get("/hosts/{host_id}/tls")
+async def host_tls(host_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """The pinned certificate and the one the host presents right now."""
+    host = _get_host(db, host_id)
+    presented, error = "", ""
+    try:
+        presented = await asyncio.to_thread(tlspin.fetch, host.host, host.port, 10)
+    except Exception as exc:  # noqa: BLE001
+        error = f"Could not read the certificate from {host.host}:{host.port} ({exc.__class__.__name__})."
+    pinned = tlspin.normalize(host.tls_fingerprint)
+    return {"mode": "ca" if host.verify_ssl else ("pinned" if pinned else "pending"),
+            "pinned": tlspin.pretty(pinned), "presented": tlspin.pretty(presented),
+            "match": bool(pinned and presented and pinned == presented), "error": error}
+
+
+class TlsAcceptIn(BaseModel):
+    fingerprint: str = Field(min_length=1, max_length=100)
+
+
+@router.post("/hosts/{host_id}/tls/accept")
+async def host_tls_accept(host_id: int, body: TlsAcceptIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """Pin the certificate the host presents now. The admin must send the fingerprint they were
+    shown (and checked on the node); it must still be what the host presents."""
+    host = _get_host(db, host_id)
+    if host.verify_ssl:
+        raise HTTPException(400, "This host is verified against the system CAs (Verify SSL), so it has no pin.")
+    want = tlspin.normalize(body.fingerprint)
+    if not want:
+        raise HTTPException(400, "That isn't a SHA-256 fingerprint.")
+    try:
+        presented = await asyncio.to_thread(tlspin.fetch, host.host, host.port, 10)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Could not read the certificate from {host.host}:{host.port} ({exc.__class__.__name__}).")
+    if presented != want:
+        raise HTTPException(409, "The host presents a different certificate than the one you accepted "
+                                 f"({tlspin.pretty(presented)}). Check again.")
+    old = host.tls_fingerprint
+    host.tls_fingerprint = want
+    host.last_error = ""
+    db.commit()
+    note_current(action="host.tls_accept", host_name=host.name,
+                 details={"previous_sha256": tlspin.pretty(old), "sha256": tlspin.pretty(want)})
+    if host.enabled:
+        asyncio.create_task(poller.poll_one_now(host.id))
+    return {"ok": True, "pinned": tlspin.pretty(want)}
 
 
 @router.post("/hosts/{host_id}/refresh")
@@ -542,8 +688,14 @@ async def ssh_test(body: SshTestIn, db: Session = Depends(get_db), user: User = 
     secret = body.ssh_secret
     if body.ssh_auth != "appkey" and not secret:
         if body.host_id is not None:
-            stored = _get_host(db, body.host_id).ssh_secret_enc
-            secret = crypto.decrypt(stored) if stored else ""
+            h = _get_host(db, body.host_id)
+            # a stored SSH key / password only goes to the stored address and user
+            if (body.host.strip().lower() != h.host.strip().lower() or (body.ssh_user.strip() or "root") != (h.ssh_user or "root")
+                    or body.ssh_port != (h.ssh_port or 22) or body.ssh_auth != h.ssh_auth):
+                note_current(details={"refused": "stored SSH secret not reused for a different address or user"})
+                return {"ok": False, "error": "The address or SSH user differs from the saved host, so the saved "
+                                              "SSH key / password is not sent. Enter it to test these settings."}
+            secret = crypto.decrypt(h.ssh_secret_enc) if h.ssh_secret_enc else ""
         if not secret:
             return {"ok": False, "error": "Enter the SSH private key / password first."}
     loop = asyncio.get_running_loop()
@@ -635,11 +787,19 @@ def _check_node(host: ProxmoxHost, node: str, needs_ssh: bool = True) -> None:
         raise HTTPException(400, "Host is disabled")
 
 
+_JOB_AUDIT_KEYS = ("action", "force_stop", "snapname", "vmstate", "storage", "mode", "compress", "disk", "add_gb",
+                   "size_before", "onboot", "auto_reboot", "type", "name")
+
+
 def _start(host: ProxmoxHost, node: str, kind: str, user: User, options: dict, vmid: int | None = None) -> dict:
+    det = {"job": kind, **{k: options[k] for k in _JOB_AUDIT_KEYS if k in options}}
+    note_current(action="job." + kind, host_name=host.name, node=node, vmid=vmid, details=det)
     try:
         job_id = jobs.start_job(host.id, node, kind, user.username, options, vmid=vmid)
     except RuntimeError as exc:
+        note_current(details={"refused": str(exc)[:200]})
         raise HTTPException(409, str(exc))
+    note_current(details={"job_id": job_id})
     return {"job_id": job_id}
 
 
@@ -697,7 +857,7 @@ def node_api_reboot(host_id: int, node: str, body: JobIn, db: Session = Depends(
 
 
 # --------------------------------------------------------------------------- #
-# Guests: power, snapshot, backup (Proxmox API jobs, admin only)
+# Guests: power, snapshot, backup (Proxmox API jobs; admins and technicians, see permissions.py)
 # --------------------------------------------------------------------------- #
 
 def _guest(host: ProxmoxHost, node: str, vmid: int) -> dict:
@@ -711,6 +871,8 @@ def _guest(host: ProxmoxHost, node: str, vmid: int) -> dict:
             continue
         if g.get("node") != node:
             raise HTTPException(409, f"Guest {vmid} is on node {g.get('node')} now, not {node}. Refresh the page and try again.")
+        if g.get("node_offline"):
+            raise HTTPException(409, f"Node {node} is offline, so guest {vmid} can't be managed until it is back.")
         return g
     raise HTTPException(404, f"Guest {vmid} is not in the last poll of this host. Refresh the host and try again.")
 
@@ -727,7 +889,7 @@ class GuestPowerIn(BaseModel):
 
 @router.post("/hosts/{host_id}/nodes/{node}/guests/{vmid}/power", status_code=202)
 def guest_power(host_id: int, node: str, vmid: int, body: GuestPowerIn, db: Session = Depends(get_db),
-                user: User = Depends(require_admin)):
+                user: User = Depends(require_cap(perms.GUEST_POWER))):
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
     g = _guest(host, node, vmid)
@@ -747,7 +909,7 @@ class GuestSnapshotIn(BaseModel):
 
 @router.post("/hosts/{host_id}/nodes/{node}/guests/{vmid}/snapshot", status_code=202)
 def guest_snapshot(host_id: int, node: str, vmid: int, body: GuestSnapshotIn, db: Session = Depends(get_db),
-                   user: User = Depends(require_admin)):
+                   user: User = Depends(require_cap(perms.GUEST_SNAPSHOT))):
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
     g = _guest(host, node, vmid)
@@ -770,7 +932,7 @@ class GuestBackupIn(BaseModel):
 
 
 @router.get("/hosts/{host_id}/nodes/{node}/backup-storages")
-async def backup_storages(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+async def backup_storages(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_cap(perms.GUEST_BACKUP))):
     """Storages on the node that accept backups (live from Proxmox)."""
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
@@ -784,7 +946,7 @@ async def backup_storages(host_id: int, node: str, db: Session = Depends(get_db)
 
 @router.post("/hosts/{host_id}/nodes/{node}/guests/{vmid}/backup", status_code=202)
 async def guest_backup(host_id: int, node: str, vmid: int, body: GuestBackupIn, db: Session = Depends(get_db),
-                       user: User = Depends(require_admin)):
+                       user: User = Depends(require_cap(perms.GUEST_BACKUP))):
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
     g = _guest(host, node, vmid)
@@ -803,7 +965,7 @@ async def guest_backup(host_id: int, node: str, vmid: int, body: GuestBackupIn, 
 
 @router.get("/hosts/{host_id}/nodes/{node}/guests/{vmid}/disks")
 async def guest_disks_list(host_id: int, node: str, vmid: int, db: Session = Depends(get_db),
-                           user: User = Depends(require_admin)):
+                           user: User = Depends(require_cap(perms.GUEST_DISK))):
     """Disks of a guest that can be expanded (live from its Proxmox config)."""
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
@@ -818,7 +980,7 @@ async def guest_disks_list(host_id: int, node: str, vmid: int, db: Session = Dep
 
 @router.get("/hosts/{host_id}/nodes/{node}/guests/{vmid}/details")
 async def guest_details_get(host_id: int, node: str, vmid: int, db: Session = Depends(get_db),
-                            user: User = Depends(require_admin)):
+                            user: User = Depends(require_cap(perms.GUEST_DETAILS))):
     """Start at boot, startup order, network adapters with bridge / VLAN, and the disks that
     can be expanded (live from the guest's Proxmox config)."""
     host = _get_host(db, host_id)
@@ -838,7 +1000,7 @@ class GuestOnbootIn(BaseModel):
 
 @router.post("/hosts/{host_id}/nodes/{node}/guests/{vmid}/onboot", status_code=202)
 def guest_onboot(host_id: int, node: str, vmid: int, body: GuestOnbootIn, db: Session = Depends(get_db),
-                 user: User = Depends(require_admin)):
+                 user: User = Depends(require_cap(perms.GUEST_ONBOOT))):
     """Turn "Start at boot" on or off. Runs as a job so the change is recorded with the user."""
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
@@ -855,7 +1017,7 @@ class GuestResizeIn(BaseModel):
 
 @router.post("/hosts/{host_id}/nodes/{node}/guests/{vmid}/resize", status_code=202)
 async def guest_resize(host_id: int, node: str, vmid: int, body: GuestResizeIn, db: Session = Depends(get_db),
-                       user: User = Depends(require_admin)):
+                       user: User = Depends(require_cap(perms.GUEST_DISK))):
     host = _get_host(db, host_id)
     _check_node(host, node, needs_ssh=False)
     g = _guest(host, node, vmid)
@@ -873,57 +1035,12 @@ async def guest_resize(host_id: int, node: str, vmid: int, body: GuestResizeIn, 
     return _start(host, node, "guest_resize", user, options, vmid=vmid)
 
 
-class ConsoleLoginIn(BaseModel):
-    password: str = Field(default="", max_length=512)
-    remember: bool = False
-
-
-@router.post("/hosts/{host_id}/console-login")
-async def console_login(host_id: int, body: ConsoleLoginIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    """Get a root@pam ticket so the browser can sign in to the PVE web UI (Upgrade shell).
-
-    The password comes from the request, the host's own credentials (password auth as
-    root@pam) or a saved console password. Only the 2-hour ticket goes back to the browser.
-    """
-    host = _get_host(db, host_id)
-    source = _console_source(host)
-    if body.password:
-        password, source = body.password, "typed"
-    elif source == "host":
-        password = crypto.decrypt(host.secret_enc)
-    elif source == "saved":
-        password = crypto.decrypt(host.console_secret_enc)
-    else:
-        raise HTTPException(409, "Enter the root@pam password for this host.")
-    try:
-        ticket = await asyncio.to_thread(console_ticket, host, password)
-    except ConsoleAuthError as exc:
-        if source == "saved":
-            host.console_secret_enc = ""
-            db.commit()
-            raise HTTPException(409, "The saved root password no longer works and was removed. Enter it again.") from exc
-        if source == "host":
-            raise HTTPException(409, "The root password stored for this host was rejected. Enter it here, "
-                                     "and update the host's credentials too.") from exc
-        raise HTTPException(422, str(exc)) from exc
-    except PveError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    if source == "typed" and body.remember:
-        host.console_secret_enc = crypto.encrypt(body.password)
-        db.commit()
-    elif source == "typed" and not body.remember and host.console_secret_enc:
-        host.console_secret_enc = ""
-        db.commit()
-    return {
-        "login_url": host.ui_url.rstrip("/") + "/api2/html/access/ticket",
-        "username": "root@pam",
-        "ticket": ticket,
-        "saved": bool(host.console_secret_enc),
-    }
+# The browser-side sign-in (POST /console-login returning a root@pam ticket) was
+# replaced by the console relay in routers/console.py; the root ticket never leaves the server.
 
 
 @router.delete("/hosts/{host_id}/console-login", status_code=204)
-def console_login_forget(host_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+def console_login_forget(host_id: int, db: Session = Depends(get_db), user: User = Depends(require_cap(perms.CONSOLE))):
     host = _get_host(db, host_id)
     host.console_secret_enc = ""
     db.commit()
@@ -947,6 +1064,27 @@ def host_jobs(host_id: int, db: Session = Depends(get_db), user: User = Depends(
     host = _get_host(db, host_id)
     rows = db.query(Job).filter(Job.host_id == host.id).order_by(Job.created_at.desc()).limit(50).all()
     return [_job_public(j, with_output=False) for j in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Node network
+# --------------------------------------------------------------------------- #
+
+@router.get("/hosts/{host_id}/nodes/{node}/network")
+async def node_network_get(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """Read-only: interfaces, addresses, bridges / bonds / VLANs and DNS of one node (every role)."""
+    host = _get_host(db, host_id)
+    if not _NODE_NAME_RE.fullmatch(node):
+        raise HTTPException(404, "Unknown node")
+    _check_node(host, node, needs_ssh=False)
+    loop = asyncio.get_running_loop()
+    try:
+        net = await loop.run_in_executor(None, node_network, host, node)
+    except (PveError, ValueError) as exc:
+        raise HTTPException(502, str(exc))
+    s = _summary(host) or {}
+    mgmt = next((n.get("ip", "") for n in s.get("nodes", []) if n.get("node") == node), "")
+    return {"node": node, "management_ip": mgmt, **net}
 
 
 # --------------------------------------------------------------------------- #
@@ -1038,27 +1176,150 @@ async def node_smart_all(host_id: int, node: str, db: Session = Depends(get_db),
 # Users
 # --------------------------------------------------------------------------- #
 
-def _user_public(u: User) -> dict:
-    return {
+_authlog = logging.getLogger("app.auth")
+
+
+def _user_public(u: User, cfg: loginconfig.LoginConfig | None = None) -> dict:
+    d = {
         "id": u.id,
         "username": u.username,
         "role": u.role,
         "is_active": u.is_active,
         "created_at": _iso(u.created_at),
         "last_login_at": _iso(u.last_login_at),
+        "auth_source": u.auth_source or "local",
+        "display_name": u.display_name or "",
+        "mfa_enabled": bool(u.mfa_enabled),
+        "must_change_password": bool(u.must_change_password) and not u.is_sso,
     }
+    if cfg is not None:
+        d["mfa_required"] = cfg.mfa_required(u)
+    d["enroll_code_pending"] = (not u.mfa_enabled) and mfa.enroll_code_pending(u)
+    return d
+
+
+def _maybe_enroll_code(db: Session, u: User) -> str:
+    """A local admin / technician without an authenticator gets a one-time enrollment code
+    (returned once to the admin, shown in the UI) when MFA sign-in is in use."""
+    cfg = loginconfig.load(db)
+    if u.is_sso or u.mfa_enabled or not cfg.mfa_available or not cfg.mfa_required(u):
+        return ""
+    return mfa.new_enroll_code(u)
 
 
 class UserIn(BaseModel):
     username: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9._@\-]+$")
     password: str = Field(default="", max_length=128)
-    role: Literal["admin", "viewer"] = "viewer"
+    role: Literal["admin", "technician", "viewer"] = "viewer"
     is_active: bool = True
 
 
 @router.get("/me")
-def me(user: User = Depends(require_user)):
-    return _user_public(user)
+def me(db: Session = Depends(get_db), user: User = Depends(require_user)):
+    cfg = loginconfig.load(db)
+    d = _user_public(user, cfg)
+    d["login_mode"] = cfg.mode
+    d["mfa_available"] = cfg.mfa_available
+    d["recovery_codes_left"] = mfa.recovery_left(user) if user.mfa_enabled else 0
+    d["caps"] = user.caps
+    d["theme"] = clean_theme(user.theme)
+    return d
+
+
+class ThemeIn(BaseModel):
+    theme: Literal["dark", "light", "system"]
+
+
+@router.put("/me/theme")
+def set_my_theme(body: ThemeIn, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """Colour theme for this account (follows the user to every browser)."""
+    from fastapi.responses import JSONResponse
+
+    note_current(action="account.theme", details={"theme": body.theme})
+    db_user = db.get(User, user.id)
+    db_user.theme = body.theme
+    db.commit()
+    resp = JSONResponse({"ok": True, "theme": body.theme})
+    theme_cookie(resp, body.theme)
+    return resp
+
+
+@router.get("/login-config")
+def login_config(db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """Current sign-in mode (read only; change it with manage.py configure-login)."""
+    cfg = loginconfig.load(db)
+    return {"mode": cfg.mode, "label": loginconfig.MODE_LABELS[cfg.mode], "configured": cfg.configured,
+            "entra_tenant": cfg.tenant, "entra_client_id": cfg.client_id, "entra_redirect_uri": cfg.redirect_uri,
+            "entra_ready": cfg.entra_ready}
+
+
+class MfaCodeIn(BaseModel):
+    code: str = Field(default="", max_length=16)
+
+
+def _local_mfa_user(db: Session, user: User) -> tuple[User, loginconfig.LoginConfig]:
+    cfg = loginconfig.load(db)
+    if user.is_sso:
+        raise HTTPException(400, "Microsoft accounts use Entra ID for two-step sign-in.")
+    if not cfg.mfa_available:
+        raise HTTPException(400, "Two-step sign-in is not enabled on this dashboard (login mode is password only).")
+    return db.get(User, user.id), cfg
+
+
+@router.post("/me/mfa/setup")
+def mfa_setup(db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """Start enrolling an authenticator app: returns the secret and a QR code."""
+    note_current(category="auth", action="account.mfa.setup")
+    u, _cfg = _local_mfa_user(db, user)
+    if u.mfa_enabled:
+        raise HTTPException(400, "Two-step sign-in is already on. Turn it off first to move it to a new phone.")
+    secret = mfa.start_enrollment(u)
+    db.commit()
+    uri = mfa.provisioning_uri(secret, u.username)
+    return {"secret": secret, "uri": uri, "qr_svg": mfa.qr_svg(uri)}
+
+
+@router.post("/me/mfa/enable")
+def mfa_enable(body: MfaCodeIn, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    note_current(category="auth", action="account.mfa.enable")
+    u, _cfg = _local_mfa_user(db, user)
+    codes = mfa.finish_enrollment(u, body.code)
+    if codes is None:
+        raise HTTPException(400, "That code didn't match. Enter the current 6-digit code from the app.")
+    db.commit()
+    request.session["amr"] = "mfa"
+    _authlog.info("mfa enrolled user=%s (account page)", u.username)
+    return {"recovery_codes": codes}
+
+
+@router.post("/me/mfa/disable")
+def mfa_disable(body: MfaCodeIn, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    note_current(category="auth", action="account.mfa.disable")
+    u, cfg = _local_mfa_user(db, user)
+    if cfg.mfa_required(u):
+        raise HTTPException(400, "Two-step sign-in is required for admin and technician accounts and can't be turned off.")
+    if not u.mfa_enabled:
+        return {"ok": True}
+    if not (mfa.verify_user_code(u, body.code) or mfa.use_recovery_code(u, body.code)):
+        raise HTTPException(400, "Wrong code.")
+    mfa.disable(u)
+    db.commit()
+    _authlog.info("mfa disabled user=%s (account page)", u.username)
+    return {"ok": True}
+
+
+@router.post("/me/mfa/recovery-codes")
+def mfa_new_recovery(body: MfaCodeIn, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    note_current(category="auth", action="account.mfa.recovery_codes")
+    u, _cfg = _local_mfa_user(db, user)
+    if not u.mfa_enabled:
+        raise HTTPException(400, "Two-step sign-in is not on.")
+    if not mfa.verify_user_code(u, body.code):
+        raise HTTPException(400, "Wrong code. Enter the current code from your authenticator app.")
+    codes = mfa.new_recovery_codes(u)
+    db.commit()
+    _authlog.info("mfa recovery codes regenerated user=%s", u.username)
+    return {"recovery_codes": codes}
 
 
 class PasswordChangeIn(BaseModel):
@@ -1067,7 +1328,10 @@ class PasswordChangeIn(BaseModel):
 
 
 @router.post("/me/password")
-def change_my_password(body: PasswordChangeIn, db: Session = Depends(get_db), user: User = Depends(require_user)):
+def change_my_password(body: PasswordChangeIn, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    note_current(category="auth", action="account.password")
+    if user.is_sso:
+        raise HTTPException(400, "Microsoft accounts have no password here; change it in Microsoft 365.")
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(400, "Current password is incorrect")
     err = validate_password_strength(body.new_password)
@@ -1075,13 +1339,55 @@ def change_my_password(body: PasswordChangeIn, db: Session = Depends(get_db), us
         raise HTTPException(400, err)
     db_user = db.get(User, user.id)
     db_user.password_hash = hash_password(body.new_password)
+    db_user.must_change_password = False
+    db_user.rotate_session_key()                    # other browsers are signed out...
+    request.session["uk"] = db_user.session_key     # ...this one stays signed in
     db.commit()
+    note_current(details={"other_sessions_signed_out": True})
     return {"ok": True}
 
 
 @router.get("/users")
 def users_list(db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    return [_user_public(u) for u in db.query(User).order_by(User.username).all()]
+    cfg = loginconfig.load(db)
+    return [_user_public(u, cfg) for u in db.query(User).order_by(User.username).all()]
+
+
+@router.delete("/users/{user_id}/mfa")
+def users_reset_mfa(user_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """Remove a user's authenticator so they enroll again at next sign-in."""
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "User not found")
+    if u.id == user.id:
+        raise HTTPException(400, "Reset your own authenticator from your Account page, or ask another admin.")
+    if u.is_sso:
+        raise HTTPException(400, "Microsoft accounts use Entra ID for two-step sign-in.")
+    mfa.disable(u)
+    u.rotate_session_key()
+    code = _maybe_enroll_code(db, u)
+    db.commit()
+    _authlog.warning("mfa reset user=%s by=%s", u.username, user.username)
+    note_current(category="auth", action="user.mfa_reset", target_user=u.username, details={"enrollment_code_issued": bool(code)})
+    return {"ok": True, "enrollment_code": code}
+
+
+@router.post("/users/{user_id}/enrollment-code")
+def users_enroll_code(user_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """A new one-time authenticator enrollment code for a user who must use one."""
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(404, "User not found")
+    if u.is_sso:
+        raise HTTPException(400, "Microsoft accounts use Entra ID for two-step sign-in.")
+    if u.mfa_enabled:
+        raise HTTPException(400, "This user already has an authenticator. Reset it first to move it to a new phone.")
+    code = _maybe_enroll_code(db, u)
+    if not code:
+        raise HTTPException(400, "This user doesn't need an authenticator in the current sign-in mode.")
+    db.commit()
+    note_current(category="auth", action="user.enroll_code", target_user=u.username, details={"valid_days": mfa.ENROLL_CODE_DAYS})
+    return {"enrollment_code": code, "valid_days": mfa.ENROLL_CODE_DAYS}
 
 
 @router.post("/users", status_code=201)
@@ -1091,23 +1397,47 @@ def users_create(body: UserIn, db: Session = Depends(get_db), user: User = Depen
         raise HTTPException(400, err)
     if db.query(User).filter(User.username == body.username).first():
         raise HTTPException(409, "Username already exists")
-    u = User(username=body.username, password_hash=hash_password(body.password), role=body.role, is_active=body.is_active)
+    # the user replaces the admin-chosen password at the first sign-in
+    u = User(username=body.username, password_hash=hash_password(body.password), role=body.role, is_active=body.is_active,
+             must_change_password=True)
+    code = _maybe_enroll_code(db, u)
     db.add(u)
     db.commit()
     db.refresh(u)
-    return _user_public(u)
+    note_current(action="user.create", target_user=u.username, details={"role": u.role, "active": u.is_active,
+                                                                        "enrollment_code_issued": bool(code),
+                                                                        "password_change_required": True})
+    return {**_user_public(u), "enrollment_code": code}
 
 
 @router.put("/users/{user_id}")
-def users_update(user_id: int, body: UserIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+def users_update(user_id: int, body: UserIn, request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     u = db.get(User, user_id)
     if u is None:
         raise HTTPException(404, "User not found")
+    note_current(action="user.update", target_user=u.username)
     if u.id == user.id and (body.role != "admin" or not body.is_active):
         raise HTTPException(400, "You cannot demote or disable your own account")
+    if u.is_sso:
+        # Name and role come from Entra ID at every sign-in; only enable/disable is managed here.
+        if body.password:
+            raise HTTPException(400, "Microsoft accounts have no password here.")
+        was_active = u.is_active
+        u.is_active = body.is_active
+        if was_active != u.is_active:
+            u.rotate_session_key()
+        db.commit()
+        note_current(details={"changed": ["active"] if was_active != u.is_active else [], "active": u.is_active})
+        _after_user_change(u)
+        return _user_public(u)
     clash = db.query(User).filter(User.username == body.username, User.id != u.id).first()
     if clash:
         raise HTTPException(409, "Username already exists")
+    before = {"username": u.username, "role": u.role, "active": u.is_active}
+    promoted = before["role"] == "viewer" and body.role in ("admin", "technician")
+    if promoted and u.mfa_enabled:
+        # an authenticator a viewer set up without an enrollment code isn't trusted for a privileged role
+        mfa.disable(u)
     u.username = body.username
     u.role = body.role
     u.is_active = body.is_active
@@ -1116,8 +1446,35 @@ def users_update(user_id: int, body: UserIn, db: Session = Depends(get_db), user
         if err:
             raise HTTPException(400, err)
         u.password_hash = hash_password(body.password)
+        # a password an admin sets for someone else is replaced at their next sign-in
+        u.must_change_password = u.id != user.id
+    signed_out = bool(body.password) or before["role"] != u.role or before["active"] != u.is_active
+    code = _maybe_enroll_code(db, u) if before["role"] != u.role and not mfa.enroll_code_pending(u) else ""
+    if signed_out:
+        u.rotate_session_key()   # signed out of every browser
+        if u.id == user.id:
+            request.session["uk"] = u.session_key   # ...except the admin's own current one
     db.commit()
-    return _user_public(u)
+    after = {"username": u.username, "role": u.role, "active": u.is_active}
+    det = {k: f"{before[k]} -> {after[k]}" for k in before if before[k] != after[k]}
+    if body.password:
+        det["password"] = "set by admin (value not recorded)" + (", user sets a new one at next sign-in"
+                                                                  if u.must_change_password else "")
+    note_current(details={"changed": det, **({"signed_out_everywhere": True} if signed_out and u.id != user.id else {}),
+                          **({"enrollment_code_issued": True} if code else {})})
+    _after_user_change(u)
+    return {**_user_public(u), "enrollment_code": code}
+
+
+def _after_user_change(u: User) -> None:
+    """A user who lost console access (demoted, disabled) loses open consoles and re-auth windows now."""
+    from .. import consoles, stepup
+
+    if not u.can(perms.CONSOLE):
+        stepup.drop_user(u.id)
+        n = consoles.kick_user(u.id, "account changed by an admin (role or access removed)")
+        if n:
+            note_current(details={"consoles_closed": n})
 
 
 @router.delete("/users/{user_id}", status_code=204)
@@ -1127,6 +1484,13 @@ def users_delete(user_id: int, db: Session = Depends(get_db), user: User = Depen
         raise HTTPException(404, "User not found")
     if u.id == user.id:
         raise HTTPException(400, "You cannot delete your own account")
+    note_current(action="user.delete", target_user=u.username, details={"role": u.role})
+    from .. import consoles, stepup
+
+    stepup.drop_user(u.id)
+    n = consoles.kick_user(u.id, "account deleted by an admin")
+    if n:
+        note_current(details={"consoles_closed": n})
     db.delete(u)
     db.commit()
     return None

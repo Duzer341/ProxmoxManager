@@ -103,11 +103,51 @@
     if (!res.ok) {
       let msg = (data && data.detail) || res.statusText;
       if (Array.isArray(msg)) msg = msg.map(function (m) { return (m.loc ? m.loc.slice(1).join(".") + ": " : "") + m.msg; }).join("; ");
-      const err = new Error(msg); err.status = res.status;
+      const err = new Error(msg); err.status = res.status; err.data = data;
       throw err;
     }
     return data;
   };
+
+  // ---------- Console re-auth window ----------
+  // Shared by the header badge and the host page. The server is the authority: the console
+  // endpoints refuse without a valid window; this only avoids a pointless round trip.
+  PM.stepup = {
+    state: null,
+    loadedAt: 0,
+    load: async function () {
+      try { PM.stepup.set(await PM.api("GET", "/api/stepup")); } catch (e) { /* not allowed consoles */ }
+      return PM.stepup.state;
+    },
+    set: function (st) { PM.stepup.state = st; PM.stepup.loadedAt = Date.now(); PM.stepup.render(); },
+    remaining: function () {
+      const st = PM.stepup.state;
+      if (!st || !st.active) return 0;
+      return Math.max(0, st.remaining - (Date.now() - PM.stepup.loadedAt) / 1000);
+    },
+    active: function () { return PM.stepup.remaining() > 3; },
+    render: function () {
+      const el = document.getElementById("stepup-badge");
+      if (!el) return;
+      const r = PM.stepup.remaining();
+      if (r <= 0) { el.style.display = "none"; return; }
+      el.style.display = "";
+      el.querySelector(".t").textContent = r >= 60 ? Math.ceil(r / 60) + " min" : Math.ceil(r) + " s";
+    },
+    drop: async function () {
+      await PM.api("POST", "/api/stepup/drop");
+      PM.stepup.set(Object.assign({}, PM.stepup.state || {}, { active: false, remaining: 0 }));
+      PM.toast("Console access ended for this browser. You'll be asked to verify again.", "ok");
+    }
+  };
+  (function () {
+    const el = document.getElementById("stepup-badge");
+    if (!el) return;
+    PM.stepup.load();
+    setInterval(PM.stepup.render, 5000);
+    const b = document.getElementById("stepup-drop");
+    if (b) b.addEventListener("click", function () { PM.stepup.drop().catch(function (e) { PM.toast(e.message, "bad"); }); });
+  })();
 
   // ---------- UI bits ----------
   let toastTimer = null;
@@ -142,7 +182,7 @@
   PM.sparkline = function (points, color) {
     const w = 300, h = 56, pad = 2;
     if (!points || points.length < 2) {
-      return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none"><text x="4" y="30" fill="#8b98a9" font-size="11">Not enough samples yet</text></svg>';
+      return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none"><text x="4" y="30" style="fill:var(--muted)" font-size="11">Not enough samples yet</text></svg>';
     }
     const n = points.length;
     const xs = function (i) { return pad + (i / (n - 1)) * (w - pad * 2); };
@@ -151,8 +191,8 @@
     for (let i = 1; i < n; i++) d += " L" + xs(i) + " " + ys(points[i]);
     const area = d + " L" + xs(n - 1) + " " + (h - pad) + " L" + xs(0) + " " + (h - pad) + " Z";
     return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-      '<line x1="0" y1="' + ys(50) + '" x2="' + w + '" y2="' + ys(50) + '" stroke="#283241" stroke-dasharray="3 3"/>' +
-      '<path d="' + area + '" fill="' + color + '" opacity="0.15"/>' +
-      '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>';
+      '<line x1="0" y1="' + ys(50) + '" x2="' + w + '" y2="' + ys(50) + '" style="stroke:var(--border)" stroke-dasharray="3 3"/>' +
+      '<path d="' + area + '" style="fill:' + color + '" opacity="0.15"/>' +
+      '<path d="' + d + '" fill="none" style="stroke:' + color + '" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>';
   };
 })();

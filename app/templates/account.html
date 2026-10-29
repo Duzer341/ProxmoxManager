@@ -1,9 +1,38 @@
 {% extends "base.html" %}
 {% block title %}Account - Proxmox Manager{% endblock %}
 {% block content %}
-<div class="page-head"><h1>Account</h1><span class="sub">Signed in as <b>{{ current_user.username }}</b> ({{ current_user.role }})</span></div>
+<div class="page-head"><h1>Account</h1><span class="sub">Signed in as <b>{{ current_user.username }}</b> ({{ current_user.role }}){% if current_user.is_sso %} · Microsoft account{% endif %}</span></div>
 
-<div class="card" style="max-width:420px">
+<div class="grid-2" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 420px)); gap:16px; align-items:start; margin-bottom:24px">
+<div class="card" id="theme-card">
+  <h2 style="margin:0 0 12px; font-size:15px">Appearance</h2>
+  <div class="seg" id="theme-seg" role="radiogroup" aria-label="Theme">
+    {% for v, label in [("dark", "Dark"), ("light", "Light"), ("system", "Match system")] %}
+    <button type="button" class="seg-btn{{ ' active' if theme == v else '' }}" data-theme-value="{{ v }}" role="radio" aria-checked="{{ 'true' if theme == v else 'false' }}">{{ label }}</button>
+    {% endfor %}
+  </div>
+  <p class="muted" style="font-size:12.5px; margin:10px 0 0">Saved to your account, so it applies on any browser you sign in from. Match system follows your computer's light or dark setting.</p>
+</div>
+{% if current_user.is_sso %}
+<div class="card">
+  <h2 style="margin:0 0 12px; font-size:15px">Microsoft sign-in</h2>
+  <p style="margin:0">You sign in with your Microsoft work account{% if current_user.display_name %} ({{ current_user.display_name }}){% endif %}.
+    Password and two-step verification are managed by your organization in Microsoft Entra ID, and your role
+    comes from the Proxmox Manager app role assigned to you there.</p>
+</div>
+{% else %}
+<div class="card" id="mfa-card" style="display:none">
+  <h2 style="margin:0 0 12px; font-size:15px">Two-step sign-in</h2>
+  <div class="flex" style="margin-bottom:10px"><span>Authenticator app:</span><span id="mfa-state"></span><span id="mfa-req"></span></div>
+  <p class="muted" id="mfa-text" style="font-size:12.5px; margin:0 0 12px"></p>
+  <div class="flex" style="gap:8px; flex-wrap:wrap">
+    <button class="btn primary sm" id="mfa-setup" style="display:none">Set up authenticator</button>
+    <button class="btn sm" id="mfa-codes" style="display:none">New recovery codes</button>
+    <button class="btn sm danger" id="mfa-off" style="display:none">Turn off</button>
+  </div>
+</div>
+
+<div class="card">
   <h2 style="margin:0 0 12px; font-size:15px">Change password</h2>
   <form id="pw-form" autocomplete="off">
     <div class="field"><label>Current password</label><input type="password" id="cur" required autocomplete="current-password"></div>
@@ -12,22 +41,156 @@
     <button class="btn primary" type="submit" id="save">Update password</button>
   </form>
 </div>
+{% endif %}
+</div>
+
+<!-- Authenticator setup -->
+<div class="modal-bg" id="mfa-modal">
+  <div class="modal" style="max-width:460px">
+    <h2>Set up authenticator app</h2>
+    <div id="mfa-step1">
+      <p style="margin-top:0">Scan this code with Google Authenticator, Microsoft Authenticator or a similar app, then enter the 6-digit code it shows.</p>
+      <div class="qr" id="mfa-qr"></div>
+      <p class="muted" style="font-size:12.5px">Can't scan it? Add the account by hand with this key (time-based):<br><span class="mono" id="mfa-secret" style="word-break:break-all"></span></p>
+      <div class="field"><label for="mfa-code">Code from the app</label><input type="text" id="mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></div>
+      <div class="foot"><button class="btn" data-close="mfa-modal">Cancel</button><button class="btn primary" id="mfa-confirm">Turn on</button></div>
+    </div>
+    <div id="mfa-step2" style="display:none">
+      <p style="margin-top:0">Save these recovery codes somewhere safe. Each one signs you in once if you lose your phone. They won't be shown again.</p>
+      <pre class="codes" id="mfa-recovery"></pre>
+      <div class="foot"><button class="btn" id="mfa-copy">Copy</button><button class="btn primary" data-close="mfa-modal" id="mfa-done">Done</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- Code prompt for turning off / new recovery codes -->
+<div class="modal-bg" id="code-modal">
+  <div class="modal" style="max-width:420px">
+    <h2 id="code-title"></h2>
+    <p style="margin-top:0" id="code-text"></p>
+    <div class="field"><label for="code-input">Code</label><input type="text" id="code-input" autocomplete="one-time-code" maxlength="11"></div>
+    <div class="foot"><button class="btn" data-close="code-modal">Cancel</button><button class="btn primary" id="code-go">Continue</button></div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
-<script>
-document.getElementById("pw-form").addEventListener("submit", async function (e) {
-  e.preventDefault();
-  const n1 = document.getElementById("new1").value, n2 = document.getElementById("new2").value;
-  if (n1 !== n2) { PM.toast("New passwords do not match", "bad"); return; }
-  const btn = document.getElementById("save");
-  PM.busy(btn, true, "Saving");
-  try {
-    await PM.api("POST", "/api/me/password", { current_password: document.getElementById("cur").value, new_password: n1 });
-    PM.toast("Password updated", "ok");
-    this.reset();
-  } catch (err) { PM.toast(err.message, "bad"); }
-  PM.busy(btn, false);
-});
+<script nonce="{{ csp_nonce }}">
+(function () {
+  const $ = function (id) { return document.getElementById(id); };
+  const pw = $("pw-form");
+  if (pw) pw.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const n1 = $("new1").value, n2 = $("new2").value;
+    if (n1 !== n2) { PM.toast("New passwords do not match", "bad"); return; }
+    const btn = $("save");
+    PM.busy(btn, true, "Saving");
+    try {
+      await PM.api("POST", "/api/me/password", { current_password: $("cur").value, new_password: n1 });
+      PM.toast("Password updated", "ok");
+      this.reset();
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+
+  // Appearance: applies at once, saved to the account.
+  document.querySelectorAll("#theme-seg [data-theme-value]").forEach(function (b) {
+    b.addEventListener("click", async function () {
+      const v = b.dataset.themeValue, root = document.documentElement, prev = root.dataset.theme;
+      if (v === prev) return;
+      function mark(val) {
+        document.querySelectorAll("#theme-seg [data-theme-value]").forEach(function (x) {
+          const on = x.dataset.themeValue === val;
+          x.classList.toggle("active", on); x.setAttribute("aria-checked", on ? "true" : "false");
+        });
+      }
+      root.dataset.theme = v; mark(v);
+      try { await PM.api("PUT", "/api/me/theme", { theme: v }); }
+      catch (err) { root.dataset.theme = prev; mark(prev); PM.toast(err.message, "bad"); }
+    });
+  });
+
+
+  if (!$("mfa-card")) return;
+  let me = null, codeAction = null;
+
+  function render() {
+    const card = $("mfa-card");
+    if (!me.mfa_available && !me.mfa_enabled) { card.style.display = "none"; return; }
+    card.style.display = "";
+    $("mfa-state").innerHTML = me.mfa_enabled ? '<span class="badge ok">On</span>' : '<span class="badge">Off</span>';
+    $("mfa-req").innerHTML = me.mfa_required ? '<span class="badge accent" title="Admin and technician accounts must use an authenticator app">required for your role</span>' : "";
+    $("mfa-text").textContent = !me.mfa_available
+      ? "This dashboard currently signs in with a password only, so the app isn't asked for."
+      : me.mfa_enabled
+        ? "You enter a code from your app after your password. Recovery codes left: " + me.recovery_codes_left + "."
+        : "Add a code from your phone to your password so a stolen password alone isn't enough.";
+    $("mfa-setup").style.display = me.mfa_available && !me.mfa_enabled ? "" : "none";
+    $("mfa-codes").style.display = me.mfa_available && me.mfa_enabled ? "" : "none";
+    $("mfa-off").style.display = me.mfa_available && me.mfa_enabled && !me.mfa_required ? "" : "none";
+  }
+  async function load() { me = await PM.api("GET", "/api/me"); render(); }
+  $("mfa-setup").addEventListener("click", async function () {
+    const btn = this;
+    PM.busy(btn, true, "Preparing");
+    try {
+      const r = await PM.api("POST", "/api/me/mfa/setup");
+      $("mfa-qr").innerHTML = r.qr_svg;
+      $("mfa-secret").textContent = r.secret;
+      $("mfa-code").value = "";
+      $("mfa-step1").style.display = ""; $("mfa-step2").style.display = "none";
+      PM.openModal("mfa-modal");
+      setTimeout(function () { $("mfa-code").focus(); }, 50);
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+  $("mfa-confirm").addEventListener("click", async function () {
+    const btn = this;
+    PM.busy(btn, true, "Checking");
+    try {
+      const r = await PM.api("POST", "/api/me/mfa/enable", { code: $("mfa-code").value.trim() });
+      $("mfa-recovery").textContent = r.recovery_codes.join("\n");
+      $("mfa-step1").style.display = "none"; $("mfa-step2").style.display = "";
+      load();
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+  $("mfa-code").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("mfa-confirm").click(); } });
+  $("mfa-copy").addEventListener("click", function () { PM.copy($("mfa-recovery").textContent, "Recovery codes"); });
+
+  function askCode(action) {
+    codeAction = action;
+    $("code-title").textContent = action === "off" ? "Turn off two-step sign-in" : "New recovery codes";
+    $("code-text").textContent = action === "off"
+      ? "Enter a code from your authenticator app (or a recovery code) to confirm."
+      : "Enter the current code from your authenticator app. Your old recovery codes stop working.";
+    $("code-input").value = "";
+    PM.openModal("code-modal");
+    setTimeout(function () { $("code-input").focus(); }, 50);
+  }
+  $("mfa-off").addEventListener("click", function () { askCode("off"); });
+  $("mfa-codes").addEventListener("click", function () { askCode("codes"); });
+  $("code-go").addEventListener("click", async function () {
+    const btn = this, code = $("code-input").value.trim();
+    PM.busy(btn, true, "Checking");
+    try {
+      if (codeAction === "off") {
+        await PM.api("POST", "/api/me/mfa/disable", { code: code });
+        PM.closeModal("code-modal"); PM.toast("Two-step sign-in turned off", "ok");
+      } else {
+        const r = await PM.api("POST", "/api/me/mfa/recovery-codes", { code: code });
+        PM.closeModal("code-modal");
+        $("mfa-recovery").textContent = r.recovery_codes.join("\n");
+        $("mfa-step1").style.display = "none"; $("mfa-step2").style.display = "";
+        PM.openModal("mfa-modal");
+      }
+      load();
+    } catch (err) { PM.toast(err.message, "bad"); }
+    PM.busy(btn, false);
+  });
+  $("code-input").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("code-go").click(); } });
+
+  load();
+})();
 </script>
 {% endblock %}

@@ -10,8 +10,8 @@
 #                    and serve it on https://<ip>/. Browsers warn once; accept it. Re-runs keep
 #                    the same certificate. No HSTS in this mode, so the warning stays clickable.
 #   --ip ADDRESS     IP for --self-signed (default: this machine's first address, hostname -I)
-#   --name NAME      DNS name the dashboard is reached by. Required with --pfx / --cert (the
-#                    certificate must cover it); optional with --self-signed (added to it)
+#   --name NAME      DNS name the dashboard is reached by (required with --pfx / --cert).
+#                    The certificate must cover it; with --self-signed it is added to the certificate
 #   --pfx FILE       certificate + key as a PFX / PKCS#12 file (asks for its password)
 #   --cert FILE      certificate as PEM (with the intermediates after it, if you have them)
 #   --chain FILE     extra intermediate certificate(s) as PEM, appended after --cert
@@ -223,6 +223,20 @@ server {
         proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto \$scheme;
         proxy_read_timeout 120s;   # SMART reads on a node with many disks can take a while
+    }
+
+    # Console relay websockets: long-lived, upgraded connections.
+    location ~ ^/console/[^/]+/ws\$ {
+        proxy_pass         http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 EOF

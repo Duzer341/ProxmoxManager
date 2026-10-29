@@ -33,7 +33,7 @@
       <pre id="sshkey-text" class="mono"></pre>
     </div>
     <div class="flex" id="sshkey-enable-wrap" style="margin-top:10px">
-      <a class="btn sm" id="sshkey-shell" target="_blank" rel="noopener">Open Proxmox web UI ↗</a>
+      {% if show_pve_links %}<a class="btn sm" id="sshkey-shell" target="_blank" rel="noopener">Open Proxmox web UI ↗</a>{% endif %}
       <button class="btn sm primary" id="sshkey-enable">Enable SSH &amp; test</button>
       <span id="sshkey-status" style="font-size:12.5px"></span>
     </div>
@@ -42,7 +42,7 @@
 
 <div class="card table-wrap" style="padding:0">
   <table id="hosts"><thead><tr>
-    <th>Name</th><th>Client</th><th>Endpoint</th><th>Auth</th><th>PVE user</th><th>SSL</th><th>SSH</th><th>Status</th><th>Last OK</th><th></th>
+    <th>Name</th><th>Client</th><th>Endpoint</th><th>Auth</th><th>PVE user</th><th>TLS</th><th>SSH</th><th>Status</th><th>Last OK</th><th></th>
   </tr></thead><tbody><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table>
 </div>
 
@@ -58,7 +58,15 @@
       <div class="row three">
         <div class="field"><label>Host (IP or DNS name)</label><input type="text" id="f-host" required placeholder="10.0.0.5 or pve1.client.local"></div>
         <div class="field"><label>Port</label><input type="number" id="f-port" value="8006" min="1" max="65535"></div>
-        <div class="field inline" style="margin-top:22px"><input type="checkbox" id="f-verify"><label for="f-verify">Verify SSL</label></div>
+        <div class="field inline" style="margin-top:22px"><input type="checkbox" id="f-verify"><label for="f-verify" title="Verify against the system's trusted CAs. Leave off for Proxmox's self-signed certificate: the dashboard then pins it instead.">Verify SSL (CA-signed)</label></div>
+      </div>
+      <div class="field" id="f-tls-wrap">
+        <div class="hint" id="f-tls" style="margin-top:-6px"></div>
+        <div class="flex" id="f-tls-actions" style="display:none; margin-top:6px">
+          <button type="button" class="btn sm" id="f-tls-check">Check certificate</button>
+          <button type="button" class="btn sm warn" id="f-tls-accept" style="display:none">Accept new certificate</button>
+          <span class="muted" id="f-tls-status" style="font-size:12px"></span>
+        </div>
       </div>
       <div class="field">
         <label>Web UI link override (optional)</label>
@@ -86,6 +94,11 @@
         or give the token itself a role under Datacenter → Permissions → Add → <b>API Token Permission</b> (path <span class="kbd">/</span>, role <span class="kbd">PVEAuditor</span>).
       </div>
       <div class="field"><label>Notes (shown on the host page)</label><textarea id="f-notes" placeholder="Site, VPN, contact…"></textarea></div>
+      <div class="field" id="f-nodenames-wrap" style="display:none">
+        <label>Node names (optional)</label>
+        <div id="f-nodenames" class="nn-grid"></div>
+        <div class="hint">A friendly name for each cluster member, shown next to the node name on the host page and in console titles.</div>
+      </div>
       <div class="field inline"><input type="checkbox" id="f-enabled" checked><label for="f-enabled">Enabled (poll this host)</label></div>
 
       <div style="border-top:1px solid var(--border); margin:14px 0 12px"></div>
@@ -152,7 +165,8 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
+const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
 (function () {
   const tb = document.querySelector("#hosts tbody");
   let hosts = [];
@@ -168,10 +182,12 @@
       return '<tr>' +
         '<td><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></td>' +
         '<td>' + PM.esc(h.client || "-") + '</td>' +
-        '<td class="mono">' + PM.esc(h.host) + ':' + h.port + ' <a href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open PVE">↗</a></td>' +
+        '<td class="mono">' + PM.esc(h.host) + ':' + h.port + (SHOW_PVE ? ' <a href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open PVE">↗</a>' : "") + '</td>' +
         '<td><span class="badge">' + (h.auth_type === "token" ? "token" : "password") + '</span></td>' +
         '<td class="mono">' + PM.esc(h.pve_user) + (h.auth_type === "token" ? "!" + PM.esc(h.token_name) : "") + '</td>' +
-        '<td>' + (h.verify_ssl ? "verify" : '<span class="muted">skip</span>') + '</td>' +
+        '<td>' + (h.tls_mode === "ca" ? '<span title="Verified against trusted CAs">CA</span>' : h.tls_mode === "pinned"
+          ? '<span title="' + PM.esc("Pinned certificate SHA-256 " + h.tls_fingerprint) + '">pinned</span>'
+          : '<span class="warn-text" title="Pinned at the next successful connection">pending</span>') + '</td>' +
         '<td>' + (h.ssh_enabled ? '<span class="badge ok" title="' + PM.esc(h.ssh_user + "@:" + h.ssh_port + " · " + h.ssh_auth) + '">' + (h.ssh_auth === "appkey" ? "key" : h.ssh_auth) + '</span>' : '<span class="muted">off</span>') + '</td>' +
         '<td>' + status + (h.last_error ? '<div class="err" style="max-width:260px">' + PM.esc(h.last_error) + '</div>' : "") + '</td>' +
         '<td class="muted nowrap">' + (h.last_ok_at ? PM.ago(h.last_ok_at) : "never") + '</td>' +
@@ -240,6 +256,9 @@
     $("f-secret").value = "";
     $("f-notes").value = h ? h.notes : "";
     $("f-enabled").checked = h ? h.enabled : true;
+    renderNodeNames(h);
+    editingHost = h; testedFingerprint = ""; presentedFingerprint = "";
+    renderTls();
     syncAuthFields();
     syncSshFields();
     $("f-delete").style.display = h ? "" : "none";
@@ -247,8 +266,86 @@
     $("f-name").focus();
   }
 
+  // Node friendly names: shown for clusters, or when names are already set.
+  function renderNodeNames(h) {
+    const names = (h && h.node_names) || {};
+    const nodes = ((h && h.nodes) || []).slice();
+    Object.keys(names).forEach(function (n) { if (nodes.indexOf(n) === -1) nodes.push(n); });
+    const show = !!h && (nodes.length > 1 || Object.keys(names).length > 0);
+    $("f-nodenames-wrap").style.display = show ? "" : "none";
+    $("f-nodenames").innerHTML = show ? nodes.map(function (n) {
+      return '<label class="nn-row"><span class="mono">' + PM.esc(n) + '</span><input type="text" data-node-name="' + PM.esc(n) +
+        '" maxlength="64" placeholder="e.g. Main server" value="' + PM.esc(names[n] || "") + '"></label>';
+    }).join("") : "";
+  }
+  function nodeNamesBody() {
+    if ($("f-nodenames-wrap").style.display === "none") return undefined;   // leave unchanged
+    const out = {};
+    document.querySelectorAll("#f-nodenames [data-node-name]").forEach(function (i) {
+      if (i.value.trim()) out[i.getAttribute("data-node-name")] = i.value.trim();
+    });
+    return out;
+  }
+
+  // ---- TLS pin ----
+  let testedFingerprint = "";   // from Test connection; pinned when the host is saved
+  let editingHost = null;
+  function renderTls() {
+    const el = $("f-tls"), acts = $("f-tls-actions");
+    $("f-tls-accept").style.display = "none"; $("f-tls-status").textContent = "";
+    if ($("f-verify").checked) {
+      el.textContent = "Certificate checked against the system's trusted CAs."; acts.style.display = "none"; return;
+    }
+    const h = editingHost;
+    const sameTarget = h && $("f-host").value.trim().toLowerCase() === (h.host || "").toLowerCase() && parseInt($("f-port").value, 10) === h.port && !h.verify_ssl;
+    if (testedFingerprint) {
+      el.innerHTML = 'Certificate SHA-256 <span class="mono">' + PM.esc(testedFingerprint) + '</span><br>' +
+        (sameTarget && h.tls_fingerprint === testedFingerprint ? "Matches the pinned certificate." : "Pinned when you save.");
+    } else if (sameTarget && h.tls_fingerprint) {
+      el.innerHTML = 'Pinned certificate SHA-256 <span class="mono">' + PM.esc(h.tls_fingerprint) + '</span>';
+    } else {
+      el.textContent = "Proxmox's self-signed certificate is pinned on first use: Test connection shows its fingerprint, or it is pinned at the first poll after saving.";
+    }
+    acts.style.display = sameTarget ? "" : "none";
+  }
+  $("f-verify").addEventListener("change", renderTls);
+  $("f-host").addEventListener("input", function () { testedFingerprint = ""; renderTls(); });
+  $("f-port").addEventListener("input", function () { testedFingerprint = ""; renderTls(); });
+  let presentedFingerprint = "";
+  $("f-tls-check").addEventListener("click", async function () {
+    const btn = this, st = $("f-tls-status");
+    PM.busy(btn, true, "Checking");
+    try {
+      const r = await PM.api("GET", "/api/hosts/" + editingHost.id + "/tls");
+      presentedFingerprint = r.presented;
+      if (r.error) { st.className = "bad-text"; st.textContent = r.error; }
+      else if (r.match) { st.className = "ok-text"; st.textContent = "The host presents the pinned certificate."; }
+      else {
+        st.className = "warn-text";
+        st.innerHTML = 'The host now presents <span class="mono">' + PM.esc(r.presented) + '</span>' + (r.pinned ? ", not the pinned one" : "") +
+          '. Check it on the node (<span class="mono">openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256</span>) before accepting.';
+        $("f-tls-accept").style.display = "";
+      }
+    } catch (err) { st.className = "bad-text"; st.textContent = err.message; }
+    PM.busy(btn, false);
+  });
+  $("f-tls-accept").addEventListener("click", async function () {
+    if (!presentedFingerprint || !confirm("Pin this certificate for " + editingHost.name + "?\n\n" + presentedFingerprint)) return;
+    const btn = this, st = $("f-tls-status");
+    PM.busy(btn, true, "Saving");
+    try {
+      const r = await PM.api("POST", "/api/hosts/" + editingHost.id + "/tls/accept", { fingerprint: presentedFingerprint });
+      editingHost.tls_fingerprint = r.pinned; btn.style.display = "none";
+      st.className = "ok-text"; st.textContent = "Pinned. Polling again.";
+      renderTls(); load();
+    } catch (err) { st.className = "bad-text"; st.textContent = err.message; }
+    PM.busy(btn, false);
+  });
+
   function formBody() {
     return {
+      tls_fingerprint: $("f-verify").checked ? "" : testedFingerprint,
+      node_names: nodeNamesBody(),
       name: $("f-name").value.trim(),
       client: $("f-client").value.trim(),
       host: $("f-host").value.trim(),
@@ -365,7 +462,7 @@
     $("sshkey-text").textContent = text;
     $("sshkey-hint").textContent = hint;
     if (h) {
-      $("sshkey-shell").href = h.ui_url;
+      if ($("sshkey-shell")) $("sshkey-shell").href = h.ui_url;
       $("sshkey-enable").textContent = h.ssh_enabled ? "Re-test SSH" : "Enable SSH & test";
     }
   }
@@ -452,7 +549,10 @@
     st.className = "status muted"; st.textContent = "Connecting…";
     try {
       const r = await PM.api("POST", "/api/hosts/test", body);
-      if (r.ok) { st.className = "status ok-text"; st.textContent = "OK — PVE " + r.version + ", nodes: " + r.nodes.join(", "); }
+      if (r.ok) {
+        st.className = "status ok-text"; st.textContent = "OK — PVE " + r.version + ", nodes: " + r.nodes.join(", ");
+        testedFingerprint = r.tls_fingerprint || ""; renderTls();
+      }
       else { st.className = "status bad-text"; st.textContent = r.error; }
     } catch (err) { st.className = "status bad-text"; st.textContent = err.message; }
     PM.busy(btn, false);

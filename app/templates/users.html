@@ -3,14 +3,15 @@
 {% block content %}
 <div class="page-head">
   <h1>Users</h1>
-  <span class="sub">Admins manage hosts and users. Viewers can see everything and run SMART reads, but cannot change configuration.</span>
+  <span class="sub">Admins manage hosts and users. Viewers can see everything and run SMART reads, but cannot change configuration.
+    <br>Sign-in: <b id="login-mode">…</b> <span class="muted">(change on the server with <span class="mono">manage.py configure-login</span>)</span></span>
   <div class="actions"><button class="btn primary" id="add">Add user</button></div>
 </div>
 
 <div class="card table-wrap" style="padding:0">
   <table id="users"><thead><tr>
-    <th>Username</th><th>Role</th><th>Status</th><th>Last login</th><th>Created</th><th></th>
-  </tr></thead><tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table>
+    <th>Username</th><th>Sign-in</th><th>Role</th><th>Two-step</th><th>Status</th><th>Last login</th><th>Created</th><th></th>
+  </tr></thead><tbody><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table>
 </div>
 
 <div class="modal-bg" id="user-modal">
@@ -18,9 +19,10 @@
     <h2 id="modal-title">Add user</h2>
     <form id="user-form" autocomplete="off">
       <input type="hidden" id="f-id">
+      <p class="muted" id="f-sso-note" style="display:none; font-size:12.5px; margin-top:0">This account signs in with Microsoft. Its name and role come from Entra ID (app role Admin, Technician or Viewer) at every sign-in; here you can only disable it.</p>
       <div class="field"><label>Username</label><input type="text" id="f-username" required pattern="[A-Za-z0-9._@\-]+" placeholder="jsmith"></div>
       <div class="field"><label id="f-pw-label">Password</label><input type="password" id="f-password" autocomplete="new-password"><div class="hint" id="f-pw-hint">At least 10 characters.</div></div>
-      <div class="field"><label>Role</label><select id="f-role"><option value="viewer">Viewer (read-only)</option><option value="admin">Admin</option></select></div>
+      <div class="field"><label>Role</label><select id="f-role"><option value="viewer">Viewer (read-only)</option><option value="technician">Technician (guest power, snapshot, backup, disks; no consoles)</option><option value="admin">Admin</option></select></div>
       <div class="field inline"><input type="checkbox" id="f-active" checked><label for="f-active">Active (can log in)</label></div>
       <div class="foot">
         <button type="button" class="btn" data-close="user-modal">Cancel</button>
@@ -29,25 +31,48 @@
     </form>
   </div>
 </div>
+<div class="modal-bg" id="code-modal">
+  <div class="modal" style="max-width:440px">
+    <h2>Enrollment code</h2>
+    <p style="margin-top:0">Give this code to <b id="code-user"></b> another way (phone, Teams). They enter it with their
+      first authenticator code when they set up two-step sign-in. It works once and expires in 7 days.</p>
+    <pre class="codes" id="code-value" style="columns:1; text-align:center; font-size:20px"></pre>
+    <div class="foot"><button class="btn" id="code-copy">Copy</button><button class="btn primary" data-close="code-modal">Done</button></div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
 (function () {
   const tb = document.querySelector("#users tbody");
   const ME = {{ current_user.id }};
   let users = [];
   const $ = function (id) { return document.getElementById(id); };
 
+  function twoStep(u) {
+    if (u.auth_source === "entra") return '<span class="muted" title="Managed by Entra ID">Entra ID</span>';
+    if (u.mfa_enabled) return '<span class="badge ok">on</span>';
+    if (u.mfa_required) return '<span class="badge warn" title="Sets up an authenticator at next sign-in, with an enrollment code from an admin">required, not set up</span>' +
+      (u.enroll_code_pending ? ' <span class="muted" style="font-size:12px">code issued</span>' : ' <span class="warn-text" style="font-size:12px">needs a code</span>');
+    return '<span class="muted">off</span>';
+  }
   function render() {
     tb.innerHTML = users.map(function (u) {
+      const sso = u.auth_source === "entra";
       return '<tr>' +
-        '<td>' + PM.esc(u.username) + (u.id === ME ? ' <span class="muted">(you)</span>' : "") + '</td>' +
-        '<td><span class="badge ' + (u.role === "admin" ? "accent" : "") + '">' + u.role + '</span></td>' +
+        '<td>' + PM.esc(u.username) + (u.id === ME ? ' <span class="muted">(you)</span>' : "") + (u.display_name ? '<div class="muted" style="font-size:12px">' + PM.esc(u.display_name) + '</div>' : "") +
+          (u.must_change_password ? ' <span class="badge warn" data-mustchange="' + u.id + '" title="The password was set by an administrator; the user chooses a new one at next sign-in">new password at sign-in</span>' : "") + '</td>' +
+        '<td>' + (sso ? '<span class="badge">Microsoft</span>' : '<span class="muted">local</span>') + '</td>' +
+        '<td><span class="badge ' + (u.role === "admin" ? "accent" : u.role === "technician" ? "info" : "") + '">' + PM.esc(u.role) + '</span></td>' +
+        '<td>' + twoStep(u) + '</td>' +
         '<td>' + (u.is_active ? '<span class="badge ok">active</span>' : '<span class="badge bad">disabled</span>') + '</td>' +
         '<td class="muted">' + (u.last_login_at ? PM.when(u.last_login_at) : "never") + '</td>' +
         '<td class="muted">' + PM.when(u.created_at) + '</td>' +
-        '<td class="right nowrap"><button class="btn sm" data-edit="' + u.id + '">Edit</button> ' + (u.id !== ME ? '<button class="btn sm danger" data-del="' + u.id + '">Delete</button>' : "") + '</td>' +
+        '<td class="right nowrap"><button class="btn sm" data-edit="' + u.id + '">Edit</button> ' +
+          (!sso && u.mfa_enabled && u.id !== ME ? '<button class="btn sm" data-resetmfa="' + u.id + '" title="Remove their authenticator; they set up a new one at next sign-in">Reset MFA</button> ' : "") +
+          (!sso && !u.mfa_enabled && u.mfa_required ? '<button class="btn sm" data-enrollcode="' + u.id + '" title="A one-time code they need to set up their authenticator">Enrollment code</button> ' : "") +
+          (u.id !== ME ? '<button class="btn sm danger" data-del="' + u.id + '">Delete</button>' : "") + '</td>' +
       '</tr>';
     }).join("");
   }
@@ -55,7 +80,16 @@
   async function load() {
     try { users = await PM.api("GET", "/api/users"); render(); }
     catch (e) { PM.toast(e.message, "bad"); }
+    try { const c = await PM.api("GET", "/api/login-config"); $("login-mode").textContent = c.label; }
+    catch (e) { $("login-mode").textContent = "unknown"; }
   }
+
+  function showCode(username, code) {
+    if (!code) return;
+    $("code-user").textContent = username; $("code-value").textContent = code;
+    PM.openModal("code-modal");
+  }
+  $("code-copy").addEventListener("click", function () { PM.copy($("code-value").textContent, "Enrollment code"); });
 
   function openForm(u) {
     $("user-form").reset();
@@ -65,9 +99,14 @@
     $("f-password").value = "";
     $("f-password").required = !u;
     $("f-pw-label").textContent = u ? "New password" : "Password";
-    $("f-pw-hint").textContent = u ? "Leave blank to keep the current password." : "At least 10 characters.";
+    $("f-pw-hint").textContent = u
+      ? (u.id === ME ? "Leave blank to keep the current password." : "Leave blank to keep the current password. A new password here is temporary: they choose their own at next sign-in.")
+      : "At least 10 characters. Temporary: the user chooses their own password at first sign-in.";
     $("f-role").value = u ? u.role : "viewer";
     $("f-active").checked = u ? u.is_active : true;
+    const sso = !!(u && u.auth_source === "entra");
+    $("f-sso-note").style.display = sso ? "" : "none";
+    $("f-username").disabled = sso; $("f-password").disabled = sso; $("f-role").disabled = sso;
     PM.openModal("user-modal");
     $("f-username").focus();
   }
@@ -75,7 +114,22 @@
   $("add").addEventListener("click", function () { openForm(null); });
 
   tb.addEventListener("click", async function (e) {
-    const edit = e.target.closest("[data-edit]"), del = e.target.closest("[data-del]");
+    const edit = e.target.closest("[data-edit]"), del = e.target.closest("[data-del]"), rm = e.target.closest("[data-resetmfa]");
+    const ec = e.target.closest("[data-enrollcode]");
+    if (ec) {
+      const u = users.find(function (x) { return x.id == ec.getAttribute("data-enrollcode"); });
+      if (u.enroll_code_pending && !confirm("A code was already issued for " + u.username + ". Replace it with a new one?")) return;
+      try { const r = await PM.api("POST", "/api/users/" + u.id + "/enrollment-code"); showCode(u.username, r.enrollment_code); load(); }
+      catch (err) { PM.toast(err.message, "bad"); }
+      return;
+    }
+    if (rm) {
+      const u = users.find(function (x) { return x.id == rm.getAttribute("data-resetmfa"); });
+      if (!confirm('Remove the authenticator app for "' + u.username + '"? They will set up a new one at their next sign-in' + (u.role === "admin" || u.role === "technician" ? " (required for their role)." : "."))) return;
+      try { const r = await PM.api("DELETE", "/api/users/" + u.id + "/mfa"); PM.toast("Authenticator removed for " + u.username, "ok"); showCode(u.username, r.enrollment_code); load(); }
+      catch (err) { PM.toast(err.message, "bad"); }
+      return;
+    }
     if (edit) openForm(users.find(function (x) { return x.id == edit.getAttribute("data-edit"); }));
     else if (del) {
       const u = users.find(function (x) { return x.id == del.getAttribute("data-del"); });
@@ -91,8 +145,8 @@
     const body = { username: $("f-username").value.trim(), password: $("f-password").value, role: $("f-role").value, is_active: $("f-active").checked };
     PM.busy(btn, true, "Saving");
     try {
-      if (id) await PM.api("PUT", "/api/users/" + id, body); else await PM.api("POST", "/api/users", body);
-      PM.closeModal("user-modal"); PM.toast("Saved", "ok"); load();
+      const r = id ? await PM.api("PUT", "/api/users/" + id, body) : await PM.api("POST", "/api/users", body);
+      PM.closeModal("user-modal"); PM.toast("Saved", "ok"); showCode(r.username, r.enrollment_code); load();
     } catch (err) { PM.toast(err.message, "bad"); }
     PM.busy(btn, false);
   });

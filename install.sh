@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Proxmox Manager - bare-metal / LXC / VM installer for Debian 12+/Ubuntu 22.04+.
+# Proxmox Manager - installer for Debian 12 / Ubuntu 24.04.
 #
 #   sudo ./install.sh            # install or upgrade in place
 #
@@ -74,6 +74,21 @@ if [[ "$NEW_INSTALL" == "1" ]]; then
     echo "   (skipped - run later:  cd $APP_DIR && runuser -u $SVC_USER -- venv/bin/python manage.py create-admin $ADMIN_USER)"
 fi
 
+# Sign-in mode: asked once (new installs, and the first upgrade to a version that has it).
+cd "$APP_DIR"
+if ! runuser -u "$SVC_USER" -- "$APP_DIR/venv/bin/python" manage.py login-configured >/dev/null 2>&1; then
+  echo
+  echo "==> Choose how people sign in"
+  if [[ -t 0 ]]; then
+    runuser -u "$SVC_USER" -- "$APP_DIR/venv/bin/python" manage.py configure-login || \
+      echo "   (skipped - run later:  cd $APP_DIR && sudo runuser -u $SVC_USER -- venv/bin/python manage.py configure-login)"
+  else
+    echo "   No terminal to ask on; using username and password. Change it with:"
+    echo "   cd $APP_DIR && sudo runuser -u $SVC_USER -- venv/bin/python manage.py configure-login"
+    runuser -u "$SVC_USER" -- "$APP_DIR/venv/bin/python" manage.py configure-login --mode local >/dev/null
+  fi
+fi
+
 echo "==> Starting service"
 systemctl restart "$SERVICE"
 sleep 2
@@ -86,4 +101,5 @@ echo "Proxmox Manager is running:  http://${IP:-<this-host>}:${PORT:-8080}/"
 echo "  Logs:            journalctl -u $SERVICE -f"
 echo "  Config:          $APP_DIR/.env"
 echo "  Manage users:    cd $APP_DIR && runuser -u $SVC_USER -- venv/bin/python manage.py list-users"
+echo "  Sign-in mode:    cd $APP_DIR && runuser -u $SVC_USER -- venv/bin/python manage.py configure-login"
 echo "  Upgrade:         copy the new files over this folder and re-run install.sh"

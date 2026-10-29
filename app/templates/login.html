@@ -1,20 +1,29 @@
 {% extends "base.html" %}
-{% block title %}Log in - Proxmox Manager{% endblock %}
+{% block title %}Sign in - Proxmox Manager{% endblock %}
 {% block content %}
 <div class="card auth-box">
   <div class="brand"><span class="logo"></span> Proxmox Manager</div>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  <form method="post" action="/login">
+  {% if error %}<div class="error" id="login-error">{{ error }}</div>{% endif %}
+  {% if sso %}
+    <a class="btn primary auth-wide" id="sso-btn" href="/auth/entra/login?next={{ next | urlencode }}">Sign in with Microsoft</a>
+    {% if not sso_ready %}<p class="muted auth-note">Microsoft sign-in is not configured yet. Run <span class="mono">manage.py configure-login</span> on the server.</p>{% endif %}
+  {% endif %}
+  {% if show_local %}
+  {% if sso %}<div class="auth-sep"><span>Local account</span></div>{% endif %}
+  <form method="post" action="/login" id="local-form">
     <input type="hidden" name="next" value="{{ next }}">
     <div class="field">
       <label for="username">Username</label>
-      <input type="text" id="username" name="username" autocomplete="username" autofocus required>
+      <input type="text" id="username" name="username" autocomplete="username" value="{{ username }}" {% if not sso %}autofocus{% endif %} required>
     </div>
     <div class="field">
       <label for="password">Password</label>
       <input type="password" id="password" name="password" autocomplete="current-password" required>
     </div>
-    <button class="btn primary" type="submit" style="width:100%; justify-content:center">Log in</button>
+    <button class="btn {{ '' if sso else 'primary' }} auth-wide" type="submit">Sign in</button>
   </form>
+  {% elif sso %}
+  <p class="auth-note"><a href="/login?local=1&amp;next={{ next | urlencode }}" id="local-link">Sign in with a local account</a></p>
+  {% endif %}
 </div>
 {% endblock %}

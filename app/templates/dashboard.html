@@ -24,7 +24,8 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
+const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
 (function () {
   const grid = document.getElementById("grid");
   const tiles = document.getElementById("tiles");
@@ -40,12 +41,13 @@
   }
 
   function renderTiles(f) {
-    const versions = Object.keys(f.versions).sort().map(function (v) { return v + ' <span class="muted">×' + f.versions[v] + '</span>'; }).join(", ");
+    const versions = Object.keys(f.versions).sort().map(function (v) { return PM.esc(v) + ' <span class="muted">×' + PM.esc(f.versions[v]) + '</span>'; }).join(", ");
     const hostsCls = f.hosts_error ? "bad-text" : "";
     tiles.innerHTML =
       tile("Hosts", f.hosts_ok + '<small>/ ' + f.hosts + '</small>', (f.hosts_error ? f.hosts_error + " with errors" : "all reachable") + (f.hosts_disabled ? ", " + f.hosts_disabled + " disabled" : ""), hostsCls) +
       tile("Nodes online", f.nodes_online + '<small>/ ' + f.nodes + '</small>', f.cores + " cores total") +
-      tile("Guests", '<span class="ok-text">' + f.guests_running + '</span><small>running</small>', f.guests_stopped + " stopped") +
+      tile("Guests", '<span class="ok-text">' + f.guests_running + '</span><small>running</small>', f.guests_stopped + " stopped" +
+        (f.guests_unknown ? ' · <span class="warn-text" title="On nodes that are offline">' + f.guests_unknown + " unknown</span>" : "")) +
       tile("Avg CPU", PM.pct(f.cpu_pct), "weighted by cores", PM.level(f.cpu_pct) + "-text") +
       tile("RAM", PM.pct(f.mem_pct), PM.bytes(f.mem_used) + " of " + PM.bytes(f.mem_total), PM.level(f.mem_pct, 85, 95) + "-text") +
       tile("Storage", PM.pct(f.disk_pct), PM.bytes(f.disk_used) + " of " + PM.bytes(f.disk_total), PM.level(f.disk_pct, 80, 90) + "-text") +
@@ -88,7 +90,8 @@
           versionBadge +
           (s.is_cluster ? '<span class="badge ' + (s.quorate === false ? "bad" : "") + '" title="Cluster">' + PM.esc(s.cluster_name) + (s.quorate === false ? " – no quorum" : "") + '</span>' : '<span class="badge">standalone</span>') +
           '<span>Nodes <b>' + s.nodes_online + '/' + s.node_count + '</b></span>' +
-          '<span>Guests <b class="ok-text">' + s.guests_running + '</b> up, <b>' + s.guests_stopped + '</b> down</span>' +
+          '<span>Guests <b class="ok-text">' + s.guests_running + '</b> up, <b>' + s.guests_stopped + '</b> down' +
+            (s.guests_unknown ? ', <b class="warn-text" title="On nodes that are offline">' + s.guests_unknown + '</b> unknown' : "") + '</span>' +
           '<span>Uptime <b>' + PM.uptime(maxUptime) + '</b></span>' +
           (s.updates ? '<span class="badge warn" title="Pending apt updates across nodes">' + s.updates + ' update' + (s.updates === 1 ? "" : "s") + '</span>' : "") +
           (s.repo_warning_nodes && s.repo_warning_nodes.length ? '<span class="badge bad" title="Proxmox updates are not visible on: ' + PM.esc(s.repo_warning_nodes.join(", ")) + ' (enterprise repo without subscription, or no Proxmox repo). Open the host for details.">repo problem</span>' : "") +
@@ -105,7 +108,7 @@
       '<div class="head"><span class="dot ' + dot + '" style="margin-top:6px"></span>' +
         '<div><div class="title"><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></div>' +
           '<div class="client">' + PM.esc(h.client || "") + (h.client ? " · " : "") + '<span class="mono">' + PM.esc(h.host) + '</span></div></div>' +
-        '<div class="right"><a class="btn sm" href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open the Proxmox web UI">Open PVE ↗</a></div>' +
+        (SHOW_PVE ? '<div class="right"><a class="btn sm" href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open the Proxmox web UI">Open PVE ↗</a></div>' : "") +
       '</div>' +
       body +
       '<div class="foot"><a class="btn sm" href="/hosts/' + h.id + '">Details</a>' +

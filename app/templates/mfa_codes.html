@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Recovery codes - Proxmox Manager{% endblock %}
+{% block content %}
+<div class="card auth-box" style="max-width:440px">
+  <div class="brand"><span class="logo"></span> Proxmox Manager</div>
+  <p style="margin-top:0">{% if first %}Two-step sign-in is on. {% endif %}Save these recovery codes somewhere safe, such as your password manager.
+    Each one signs you in once if you lose your phone. They won't be shown again.</p>
+  <pre class="codes" id="recovery-codes">{% for c in codes %}{{ c }}
+{% endfor %}</pre>
+  <div class="flex" style="gap:8px">
+    <button class="btn" type="button" id="copy-codes">Copy</button>
+    <a class="btn primary" href="{{ next }}" id="codes-continue" style="margin-left:auto">I saved them, continue</a>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script nonce="{{ csp_nonce }}">
+document.getElementById("copy-codes").addEventListener("click", function () {
+  PM.copy(document.getElementById("recovery-codes").textContent.trim(), "Recovery codes");
+});
+</script>
+{% endblock %}

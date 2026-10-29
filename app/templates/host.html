@@ -9,7 +9,7 @@
     <span class="muted" id="polled"></span>
     <button class="btn" id="refresh">Refresh now</button>
     {% if current_user.is_admin %}<a class="btn" href="/manage/hosts?edit={{ host.id }}">Edit</a><a class="btn danger" href="/manage/hosts?delete={{ host.id }}">Delete</a>{% endif %}
-    <a class="btn primary" href="{{ host.ui_url }}" target="_blank" rel="noopener">Open PVE web UI ↗</a>
+    {% if show_pve_links %}<a class="btn primary" href="{{ host.ui_url }}" target="_blank" rel="noopener">Open PVE web UI ↗</a>{% endif %}
   </div>
 </div>
 
@@ -33,7 +33,7 @@
     {% if current_user.is_admin %}<span class="muted" id="ssh-hint" style="font-weight:400; font-size:12.5px"></span>{% endif %}
   </h2>
   <div id="nodes"><div class="empty">Loading…</div></div>
-  {% if current_user.is_admin %}<div class="muted" id="shell-saved" style="display:none; font-size:12.5px; margin-top:8px">Root password saved for the terminal, Upgrade shell and guest consoles on this host. <button class="btn sm link" id="shell-forget">Forget it</button></div>{% endif %}
+  {% if current_user.can("console") %}<div class="muted" id="shell-saved" style="display:none; font-size:12.5px; margin-top:8px">Root password saved for the terminal, Upgrade shell and guest consoles on this host. <button class="btn sm link" id="shell-forget">Forget it</button></div>{% endif %}
 </div>
 
 <div class="section" id="jobs-section" style="display:none">
@@ -62,25 +62,38 @@
   <div class="modal">
     <h2>Sign in to Proxmox</h2>
     <p style="margin-top:0"><span id="shell-what">The upgrade shell</span> needs a <span class="mono">root@pam</span> login.
-      Enter the root password once and the dashboard signs this browser in to the host (good for 2 hours) and opens it.</p>
+      Enter the root password; the dashboard signs in to the host itself and relays the console to a new tab.
+      The password and the Proxmox session stay on the dashboard server.</p>
     <div class="field"><label for="shell-pw">root@pam password</label><input type="password" id="shell-pw" autocomplete="off"></div>
     <div class="field inline"><input type="checkbox" id="shell-remember"><label for="shell-remember">Remember for this host (stored encrypted, next time it's one click)</label></div>
     <p class="bad-text" id="shell-err" style="display:none; font-size:13px"></p>
     <div class="foot">
       <button class="btn" data-close="shell-modal">Cancel</button>
-      <button class="btn primary" id="shell-go">Sign in &amp; open</button>
+      <button class="btn primary" id="shell-go">Open console</button>
     </div>
   </div>
 </div>
 
-<div class="modal-bg" id="cert-modal">
+<!-- Console re-auth: a fresh check before any console -->
+<div class="modal-bg" id="stepup-modal">
   <div class="modal">
-    <h2>Accept the host's certificate</h2>
-    <p style="margin-top:0">This browser doesn't trust the certificate on <span class="mono" id="cert-host"></span> yet (Proxmox uses a self-signed one), so it can't sign you in.</p>
-    <p>In the new tab click <b>Advanced</b> → <b>Proceed / Accept the risk and continue</b>. You only have to do this once per browser. As soon as it's accepted this carries on by itself and opens the console.</p>
-    <p class="muted" style="font-size:12.5px">If the tab says the site can't be reached, this computer can't reach the host directly (VPN or firewall).</p>
-    <div class="flex muted" style="font-size:12.5px"><span class="spin"></span> Waiting for the certificate to be accepted …</div>
-    <div class="foot"><button class="btn" data-close="cert-modal">Cancel</button></div>
+    <h2>Verify it's you</h2>
+    <p style="margin-top:0">Consoles need a fresh check, even when you're signed in. Afterwards you can open consoles from this
+      browser for <b id="stepup-mins">15</b> minutes. Using them doesn't extend that.</p>
+    <div id="stepup-totp">
+      <div class="field"><label for="stepup-code">Current code from your authenticator app</label>
+        <input type="text" id="stepup-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false"></div>
+      <p class="muted" style="font-size:12.5px; margin-top:-4px">Backup codes don't work here. A code you already used to sign in can't be used again; wait for the next one.</p>
+    </div>
+    <div id="stepup-entra" style="display:none">
+      <p>You'll be sent to Microsoft to sign in again (password and any MFA your organization requires), then brought back
+        to this page. Click the console button again afterwards.</p>
+    </div>
+    <p class="bad-text" id="stepup-err" style="display:none; font-size:13px"></p>
+    <div class="foot">
+      <button class="btn" data-close="stepup-modal">Cancel</button>
+      <button class="btn primary" id="stepup-go">Verify</button>
+    </div>
   </div>
 </div>
 
@@ -123,16 +136,17 @@
     <h2 id="guest-title">Guest</h2>
     <div class="flex" id="guest-meta" style="font-size:12.5px"></div>
     <div class="gsec">
-      <h3>Boot and network</h3>
+      <h3>Boot, disks and network</h3>
       <div class="flex" id="gi-boot" style="font-size:13px; margin-bottom:10px"></div>
       <div class="gconfirm" id="ob-confirm" style="display:none; margin:-2px 0 12px">
         <p id="ob-confirm-text" style="margin-top:0"></p>
         <div class="flex"><button class="btn sm" id="ob-cancel">Cancel</button><button class="btn sm primary" id="ob-go">Turn off</button></div>
       </div>
+      <div class="table-wrap" id="gi-disks-wrap" style="display:none; margin-bottom:10px"><table id="gi-disks"><thead><tr><th>Disk</th><th>Storage</th><th class="num">Size</th><th>Notes</th></tr></thead><tbody></tbody></table></div>
       <div class="table-wrap" id="gi-nets-wrap" style="display:none"><table id="gi-nets"><thead></thead><tbody></tbody></table></div>
       <div class="muted" id="gi-status" style="font-size:12px"></div>
     </div>
-    <div class="gsec">
+    <div class="gsec" data-cap="guest.snapshot">
       <h3>Snapshot</h3>
       <div class="row">
         <div class="field"><label for="snap-name">Name</label><input type="text" id="snap-name" maxlength="40" autocomplete="off" spellcheck="false"><div class="hint">Starts with a letter; letters, digits, - and _ only.</div></div>
@@ -141,7 +155,7 @@
       <div class="field inline" id="snap-ram-wrap"><input type="checkbox" id="snap-ram"><label for="snap-ram">Include RAM, so a rollback resumes the running VM</label></div>
       <div class="flex"><button class="btn sm" id="snap-go">Take snapshot</button><span class="muted" id="snap-note" style="font-size:12px">Roll back or delete snapshots in the Proxmox web UI.</span></div>
     </div>
-    <div class="gsec">
+    <div class="gsec" data-cap="guest.backup">
       <h3>Backup</h3>
       <div class="row three">
         <div class="field"><label for="bk-storage">Storage</label><select id="bk-storage"></select></div>
@@ -152,7 +166,7 @@
       <div class="field"><label for="bk-notes">Notes</label><input type="text" id="bk-notes" maxlength="200"><div class="hint">{% raw %}{{guestname}}, {{vmid}}, {{node}} and {{cluster}}{% endraw %} are filled in by Proxmox.</div></div>
       <div class="flex"><button class="btn sm" id="bk-go">Start backup</button><span class="muted" id="bk-status" style="font-size:12px"></span></div>
     </div>
-    <div class="gsec">
+    <div class="gsec" data-cap="guest.disk">
       <h3>Expand disk</h3>
       <div class="row three">
         <div class="field"><label for="rs-disk">Disk</label><select id="rs-disk"></select></div>
@@ -189,6 +203,24 @@
   </tr></thead><tbody></tbody></table></div>
 </div>
 
+<div class="section" id="network-section">
+  <h2>Network <span class="count" id="network-count"></span>
+    <div class="actions"><button class="btn sm" id="network-refresh" title="Read the interfaces and DNS of every node again">Refresh</button></div>
+  </h2>
+  <div id="network-facts" class="net-facts-list"></div>
+  <div class="card table-wrap" style="padding:0"><table id="network" class="net-table"><thead></thead><tbody></tbody></table></div>
+</div>
+
+{% if current_user.can("console") %}
+<div class="section" id="consoles-section" style="display:none">
+  <h2>Console sessions <span class="count" id="consoles-count"></span></h2>
+  <div class="card table-wrap" style="padding:0"><table id="consoles"><thead><tr>
+    <th>When</th><th>Node</th><th>Console</th><th>By</th><th>From</th><th>Verified</th><th>Duration</th><th>Ended</th>
+  </tr></thead><tbody></tbody></table></div>
+  <button class="btn sm link" id="consoles-more" style="display:none; margin-top:6px"></button>
+</div>
+{% endif %}
+
 <!-- SMART detail modal -->
 <div class="modal-bg" id="smart-modal">
   <div class="modal wide">
@@ -200,12 +232,13 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce }}">
 (function () {
   const HOST_ID = {{ host.id }};
   let data = null;
   const diskCache = {};   // node -> disks[]
   const openNodes = {};   // node -> bool
+  const netCache = {};    // node -> {net} | {error} | {loading} (Network section)
 
   function tile(label, value, sub, cls) {
     return '<div class="tile"><div class="label">' + label + '</div><div class="value ' + (cls || "") + '">' + value + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : "") + '</div>';
@@ -219,7 +252,8 @@
     t.innerHTML =
       tile("Proxmox VE", PM.esc(s.version), mixed ? '<span class="warn-text">mixed: ' + PM.esc(s.pve_versions.join(", ")) + '</span>' : "release " + PM.esc(s.release) + (s.repoid ? " · " + PM.esc(s.repoid) : "")) +
       tile(s.is_cluster ? "Cluster" : "Mode", s.is_cluster ? PM.esc(s.cluster_name) : "Standalone", s.is_cluster ? (s.quorate ? '<span class="ok-text">quorate</span>' : '<span class="bad-text">no quorum</span>') + " · " + s.nodes_online + "/" + s.node_count + " nodes online" : "single node", s.is_cluster && !s.quorate ? "bad-text" : "") +
-      tile("Guests", '<span class="ok-text">' + s.guests_running + '</span><small>running</small>', s.guests_stopped + " stopped") +
+      tile("Guests", '<span class="ok-text">' + s.guests_running + '</span><small>running</small>', s.guests_stopped + " stopped" +
+        (s.guests_unknown ? ' · <span class="warn-text" title="On nodes that are offline">' + s.guests_unknown + " unknown</span>" : "")) +
       tile("CPU", PM.pct(s.cpu_pct), s.cores + " cores" + (avg.cpu_pct != null ? " · avg " + PM.pct(avg.cpu_pct) : ""), PM.level(s.cpu_pct) + "-text") +
       tile("RAM", PM.pct(s.mem_pct), PM.bytes(s.mem_used) + " of " + PM.bytes(s.mem_total) + (avg.mem_pct != null ? " · avg " + PM.pct(avg.mem_pct) : ""), PM.level(s.mem_pct, 85, 95) + "-text") +
       tile("Storage", PM.pct(s.disk_pct), PM.bytes(s.disk_used) + " of " + PM.bytes(s.disk_total) + (avg.disk_pct != null ? " · avg " + PM.pct(avg.disk_pct) : ""), PM.level(s.disk_pct, 80, 90) + "-text");
@@ -229,7 +263,7 @@
     const el = document.getElementById("sparks");
     if (!history || !history.length) { el.innerHTML = '<div class="muted" style="font-size:12.5px">No samples yet for this range.</div>'; return; }
     const rangeLabel = "last " + (hours >= 24 ? (hours / 24) + "d" : hours + "h");
-    const series = [["CPU", "cpu", "#58a6ff"], ["RAM", "mem", "#3fb950"], ["Storage", "disk", "#e57000"]];
+    const series = [["CPU", "cpu", "var(--info)"], ["RAM", "mem", "var(--ok)"], ["Storage", "disk", "var(--accent)"]];   // follow the theme
     el.innerHTML = series.map(function (sdef, i) {
       const pts = history.map(function (p) { return p[sdef[1]]; });
       const last = pts[pts.length - 1];
@@ -310,8 +344,111 @@
       '</tr></thead><tbody>' + disks.map(function (d) { return diskRow(node, d); }).join("") + '</tbody></table></div>';
   }
 
+  function nodeLabel(node) { return (data && data.node_names && data.node_names[node]) || ""; }
+
+  // ---- Network section under Storage ----
+  // One read per online node when the page opens (and on Refresh); polling redraws from this cache.
+  function ipOnly(cidr) { return (cidr || "").split("/")[0]; }
+  function netAddr(cidr, method) {
+    if (cidr) return PM.esc(cidr);
+    if (method === "dhcp") return '<span class="muted">DHCP</span>';
+    if (method === "auto") return '<span class="muted">SLAAC</span>';
+    return '<span class="muted">-</span>';
+  }
+  function nodeCell(node) {
+    return '<td class="nowrap">' + PM.esc(node) + (nodeLabel(node) ? ' <span class="muted">(' + PM.esc(nodeLabel(node)) + ')</span>' : "") + '</td>';
+  }
+  function netFacts(node, net) {
+    const ifs = net.interfaces || [], mgmt = net.management_ip || "";
+    const gwIf = ifs.find(function (i) { return i.gateway; });
+    const facts = [];
+    if (mgmt) facts.push('Management IP <b class="mono">' + PM.esc(mgmt) + '</b>');
+    if (gwIf) facts.push('Default gateway <b class="mono">' + PM.esc(gwIf.gateway) + '</b> <span class="muted">via ' + PM.esc(gwIf.iface) + '</span>');
+    if (net.dns) {
+      facts.push('DNS <b class="mono">' + (net.dns.servers.length ? net.dns.servers.map(PM.esc).join(", ") : "-") + '</b>');
+      if (net.dns.search) facts.push('Search domain <b class="mono">' + PM.esc(net.dns.search) + '</b>');
+    } else if (net.dns_error) {
+      facts.push('<span class="muted" title="' + PM.esc(net.dns_error) + '">DNS not readable</span>');
+    }
+    return '<div class="net-facts" data-net-node="' + PM.esc(node) + '"><span class="node-name">' + PM.esc(node) +
+      (nodeLabel(node) ? ' <span class="muted">(' + PM.esc(nodeLabel(node)) + ')</span>' : "") + '</span>' +
+      facts.map(function (f) { return '<span class="sep">·</span>' + f; }).join("") + '</div>';
+  }
+  function netRows(node, net, has6) {
+    const mgmt = net.management_ip || "";
+    return (net.interfaces || []).map(function (i) {
+      const isMgmt = mgmt && (ipOnly(i.cidr) === mgmt || ipOnly(i.cidr6) === mgmt);
+      let type = PM.esc(i.kind);
+      if (i.bond_mode) type += '<div class="muted nowrap">' + PM.esc(i.bond_mode) + '</div>';
+      if (i.mtu && i.mtu !== "1500") type += '<div class="muted nowrap">MTU ' + PM.esc(i.mtu) + '</div>';
+      let vlan = '<span class="muted">-</span>';
+      if (i.vlan_id) vlan = 'ID <b>' + PM.esc(i.vlan_id) + '</b>';
+      else if (i.vlan_aware) vlan = '<span title="VLAN-aware bridge: guests can use VLAN tags">aware</span>' + (i.vlan_ids ? ' <span class="muted mono">' + PM.esc(i.vlan_ids) + '</span>' : "");
+      const state = i.active ? '<span class="badge ok">active</span>' : '<span class="badge' + (i.type === "eth" ? "" : " warn") + '" title="' + (i.type === "eth" ? "Not configured or no link" : "Configured but not active") + '">inactive</span>';
+      return '<tr data-net-node="' + PM.esc(node) + '"' + (isMgmt ? ' class="net-mgmt"' : "") + '>' + nodeCell(node) +
+        '<td class="mono nowrap">' + PM.esc(i.iface) + (isMgmt ? ' <span class="badge accent" title="The address Proxmox resolves this node\'s name to (cluster / management traffic)">management</span>' : "") + '</td>' +
+        '<td>' + type + '</td>' +
+        '<td class="mono nowrap">' + netAddr(i.cidr, i.method) + '</td>' +
+        '<td class="mono nowrap">' + (i.gateway ? PM.esc(i.gateway) : '<span class="muted">-</span>') + '</td>' +
+        (has6 ? '<td class="mono nowrap">' + netAddr(i.cidr6, i.method6) + (i.gateway6 ? '<div class="muted">gw ' + PM.esc(i.gateway6) + '</div>' : "") + '</td>' : "") +
+        '<td class="mono">' + (i.ports ? PM.esc(i.ports) : '<span class="muted">-</span>') + '</td>' +
+        '<td class="nowrap">' + vlan + '</td>' +
+        '<td class="nowrap">' + state + (i.autostart || i.type === "eth" ? "" : ' <span class="muted" title="Not brought up at boot (autostart off)">no autostart</span>') + '</td>' +
+        '<td class="muted">' + PM.esc(i.comments || "") + '</td></tr>';
+    }).join("");
+  }
+  function renderNetwork(s) {
+    const thead = document.querySelector("#network thead"), tb = document.querySelector("#network tbody");
+    const factsEl = document.getElementById("network-facts"), countEl = document.getElementById("network-count");
+    if (!s) { thead.innerHTML = ""; tb.innerHTML = '<tr><td class="empty">No data yet.</td></tr>'; factsEl.innerHTML = ""; return; }
+    const nodes = s.nodes || [];
+    const has6 = nodes.some(function (n) {
+      const c = netCache[n.node];
+      return c && c.net && (c.net.interfaces || []).some(function (i) { return i.cidr6 || i.method6 === "dhcp" || i.method6 === "auto"; });
+    });
+    const cols = has6 ? 10 : 9;
+    thead.innerHTML = '<tr><th>Node</th><th>Interface</th><th>Type</th><th>IPv4</th><th>Gateway</th>' + (has6 ? '<th>IPv6</th>' : "") +
+      '<th>Ports / slaves</th><th>VLAN</th><th>State</th><th>Comment</th></tr>';
+    let rows = "", facts = "", total = 0;
+    nodes.forEach(function (n) {
+      const c = netCache[n.node];
+      if (!n.online) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">Node offline</td></tr>'; return; }
+      if (!c || c.loading) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">Loading network…</td></tr>'; return; }
+      if (c.error) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="err">' + PM.esc(c.error) + '</td></tr>'; return; }
+      facts += netFacts(n.node, c.net);
+      const ifs = c.net.interfaces || [];
+      total += ifs.length;
+      rows += ifs.length ? netRows(n.node, c.net, has6) : '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">No interfaces reported.</td></tr>';
+    });
+    tb.innerHTML = rows || '<tr><td colspan="' + cols + '" class="empty">No nodes.</td></tr>';
+    factsEl.innerHTML = facts;
+    countEl.textContent = total ? total + " interface" + (total === 1 ? "" : "s") + (nodes.length > 1 ? " on " + nodes.length + " nodes" : "") : "";
+  }
+  let netBusy = false;
+  async function loadNetwork(force) {
+    if (!data || !data.summary || (netBusy && !force)) return;
+    const want = (data.summary.nodes || []).filter(function (n) { return n.online && (force || !netCache[n.node]); }).map(function (n) { return n.node; });
+    if (!want.length) return;
+    netBusy = true;
+    want.forEach(function (node) { netCache[node] = { loading: true }; });
+    renderNetwork(data.summary);
+    await Promise.all(want.map(async function (node) {
+      try {
+        netCache[node] = { net: await PM.api("GET", "/api/hosts/" + HOST_ID + "/nodes/" + encodeURIComponent(node) + "/network") };
+      } catch (e) {
+        netCache[node] = { error: e.message };
+      }
+      renderNetwork(data.summary);
+    }));
+    netBusy = false;
+  }
+
   const IS_ADMIN = {{ 'true' if current_user.is_admin else 'false' }};
-  const PVE_UI = {{ host.ui_url | tojson }};
+  // What this user's role may do (app/permissions.py). The API enforces the same table.
+  const CAPS = {{ current_user.caps | tojson }};
+  function can(cap) { return CAPS.indexOf(cap) !== -1; }
+  const CAN_CONSOLE = can("console"), CAN_NODE = can("node.actions");
+  const CAN_GUEST_MORE = ["guest.details", "guest.snapshot", "guest.backup", "guest.disk", "guest.onboot"].some(can);
 
   function updatesBadge(n) {
     if (n.repo_warning) {
@@ -328,6 +465,25 @@
     return '<span class="badge warn" title="' + PM.esc(list) + '">' + n.updates + ' update' + (n.updates === 1 ? "" : "s") + (n.updates_kernel ? " incl. kernel" : "") + '</span>';
   }
 
+  // a node whose clock is off breaks consoles in a cluster (Proxmox accepts root@pam tickets from
+  // another node only within 5 minutes) while token-based polling keeps working.
+  function fmtOffset(sec) {
+    sec = Math.abs(sec);
+    return sec >= 3600 ? Math.floor(sec / 3600) + " h " + Math.floor(sec % 3600 / 60) + " min" : sec >= 60 ? Math.floor(sec / 60) + " min" : sec + " s";
+  }
+  function clockBadge(n) {
+    const o = n.clock_offset;
+    if (o == null) return "";
+    const entry = (data && data.summary && data.summary.nodes || []).find(function (x) { return x.api_entry; });
+    const rel = entry && entry.node !== n.node && entry.clock_offset != null ? o - entry.clock_offset : null;
+    if (Math.abs(o) < 60 && (rel == null || Math.abs(rel) < 60)) return "";
+    const bad = Math.abs(o) >= 240 || (rel != null && Math.abs(rel) >= 240);
+    const tip = "This node's clock is " + fmtOffset(o) + (o > 0 ? " ahead of" : " behind") + " the dashboard" +
+      (rel != null ? " and " + fmtOffset(rel) + (rel > 0 ? " ahead of " : " behind ") + entry.node + " (the node the dashboard signs in through)" : "") +
+      ". Proxmox only accepts a sign-in from another cluster node when the clocks agree within 5 minutes, so consoles on this node can fail. Fix time sync (chrony) on the node.";
+    return '<span class="badge ' + (bad ? "bad" : "warn") + '" title="' + PM.esc(tip) + '">clock ' + fmtOffset(o) + (o > 0 ? " ahead" : " behind") + '</span>';
+  }
+
   function rebootBadge(n) {
     if (!n.kernel_reboot_pending) return "";
     return '<span class="badge bad" title="A newer kernel is installed than the one running. Reboot to activate it.">reboot pending · ' + PM.esc(n.newest_kernel) + '</span>';
@@ -342,15 +498,12 @@
     const pendingTip = pending ? n.updates + " update" + (n.updates === 1 ? "" : "s") + " pending" + (n.updates_kernel ? ", including a kernel" : "") + ". " : "";
     const disks = '<button class="btn sm" data-toggle-disks="' + node + '">' + (openNodes[n.node] ? "Hide disks" : "Disks / SMART") + '</button>' +
       '<button class="btn sm" data-smart-all="' + node + '" title="Read SMART health and attributes from every disk on this node">Scan all disks</button>';
-    if (!IS_ADMIN) {
-      return '<a class="btn sm primary" data-terminal-link="' + node + '" href="' + PM.esc(terminalUrl(n.node)) + '" target="_blank" rel="noopener" title="Opens a shell on the node in the Proxmox web UI (log in as root@pam). Same as Node → Shell.">Open terminal ↗</a>' +
-        disks +
-        '<a class="' + upCls + '" data-shell-link="' + node + '" href="' + PM.esc(shellUrl(n.node)) + '" target="_blank" rel="noopener" title="' + PM.esc(pendingTip + "Install updates: opens the pveupgrade terminal in the Proxmox web UI (log in as root@pam). Same as Node → Updates → Upgrade.") + '">Upgrade shell ↗</a>';
-    }
+    if (!CAN_CONSOLE && !CAN_NODE) return disks;  // terminals and node actions are admin-only
     const ssh = data && data.ssh_enabled;
     const busyId = data && data.active_jobs && data.active_jobs[n.node];
     const dis = busyId ? ' disabled title="A job is already running on this node"' : "";
-    let html = '<button class="btn sm primary" data-terminal="' + node + '" title="Signs this browser in to Proxmox as root@pam and opens a root shell on the node (same as Node → Shell)">Open terminal ↗</button>' + disks;
+    let html = (CAN_CONSOLE ? '<button class="btn sm primary" data-terminal="' + node + '" title="Opens a root shell on the node in a new tab, relayed through the dashboard (same as Node → Shell). Asks you to verify it\'s you first.">Open terminal ↗</button>' : "") + disks;
+    if (!CAN_NODE) return html + (CAN_CONSOLE ? upgradeBtn(n, node, upCls, pendingTip) : "");
     if (n.repo_warning === "enterprise_no_subscription")
       html += '<button class="btn sm primary" data-switch-repos="' + node + '"' + dis + ' title="Disable the enterprise repositories and add No-Subscription (same as Node > Updates > Repositories in Proxmox)">Switch to no-subscription</button>';
     html += '<button class="btn sm" data-refresh-pkgs="' + node + '"' + dis + ' title="Run apt update through the Proxmox API so the pending-update list is current (no SSH)">Refresh package list</button>';
@@ -358,10 +511,14 @@
       html += '<button class="btn sm" data-check="' + node + '"' + dis + '>Check updates (SSH)</button>' +
         '<button class="btn sm primary" data-upgrade="' + node + '"' + dis + '>Update node (SSH)</button>';
     }
-    html += '<button class="' + upCls + '" data-shell="' + node + '" title="' + PM.esc(pendingTip + "Install updates: signs this browser in to Proxmox as root@pam and opens the pveupgrade terminal (same as Node → Updates → Upgrade)") + '">Upgrade shell ↗</button>';
+    if (CAN_CONSOLE) html += upgradeBtn(n, node, upCls, pendingTip);
     html += '<button class="btn sm danger" data-reboot="' + node + '" data-via="' + (ssh ? "ssh" : "api") + '"' + dis + '>Reboot node</button>';
     if (busyId) html += '<button class="btn sm" data-job="' + busyId + '"><span class="spin"></span> View job</button>';
     return html;
+  }
+
+  function upgradeBtn(n, node, upCls, pendingTip) {
+    return '<button class="' + upCls + '" data-shell="' + node + '" title="' + PM.esc(pendingTip + "Install updates: opens the pveupgrade terminal in a new tab, relayed through the dashboard (same as Node → Updates → Upgrade)") + '">Upgrade shell ↗</button>';
   }
 
   function renderNodes(s) {
@@ -378,15 +535,17 @@
       return '<div class="node' + open + '" data-node="' + PM.esc(n.node) + '">' +
         '<div class="node-head">' +
           '<span class="dot ' + (n.online ? "ok" : "bad") + '"></span><span class="name">' + PM.esc(n.node) + '</span>' +
+          (nodeLabel(n.node) ? '<span class="node-label" title="Friendly name (Edit host)">(' + PM.esc(nodeLabel(n.node)) + ')</span>' : "") +
           '<span class="badge ' + (n.online ? "" : "bad") + '">' + PM.esc(n.status) + '</span>' +
-          (n.online ? updatesBadge(n) + rebootBadge(n) : "") +
+          (n.online ? updatesBadge(n) + rebootBadge(n) + clockBadge(n) : "") +
+          (n.ip ? '<span class="kv">IP <button type="button" class="ip-copy mono" data-copy-ip="' + PM.esc(n.ip) + '" title="Management IP of this node. Click to copy.">' + PM.esc(n.ip) + '</button></span>' : "") +
           (n.pve_version ? '<span class="kv">' + PM.esc(n.pve_version) + '</span>' : "") +
           (n.kernel ? '<span class="kv">kernel <b>' + PM.esc(n.kernel) + '</b></span>' : "") +
           (n.cpu_model ? '<span class="kv" title="' + PM.esc(n.cpu_model) + '">' + n.cores + ' × ' + PM.esc(n.cpu_model.length > 34 ? n.cpu_model.slice(0, 34) + "…" : n.cpu_model) + '</span>' : '<span class="kv"><b>' + n.cores + '</b> cores</span>') +
           '<span class="kv">CPU <b>' + PM.pct(n.cpu_pct) + '</b></span>' +
           '<span class="kv">RAM <b>' + PM.bytes(n.mem_used) + '</b> / ' + PM.bytes(n.mem_total) + ' (' + PM.pct(n.mem_pct) + ')</span>' +
           '<span class="kv">root <b>' + PM.bytes(n.rootfs_used) + '</b> / ' + PM.bytes(n.rootfs_total) + '</span>' +
-          (n.loadavg && n.loadavg.length ? '<span class="kv">load <b>' + n.loadavg.join(" ") + '</b></span>' : "") +
+          (n.loadavg && n.loadavg.length ? '<span class="kv">load <b>' + n.loadavg.map(PM.esc).join(" ") + '</b></span>' : "") +
           '<span class="kv">up <b>' + PM.uptime(n.uptime) + '</b></span>' +
           '<div class="actions">' + nodeActions(n) + '</div>' +
         '</div>' +
@@ -395,19 +554,13 @@
     }).join("");
   }
 
-  // Console URL in the Proxmox web UI: noVNC for VMs, xterm.js for containers.
-  function consoleUrl(g) {
-    const base = PVE_UI.replace(/\/+$/, "");
-    const q = "&vmid=" + encodeURIComponent(g.vmid) + "&vmname=" + encodeURIComponent(g.name || "") + "&node=" + encodeURIComponent(g.node);
-    return g.type === "qemu" ? base + "/?console=kvm&novnc=1" + q + "&resize=off&cmd=" : base + "/?console=lxc&xtermjs=1" + q + "&cmd=";
-  }
-
   function guestActions(g) {
+    if (g.node_offline) return '<span class="muted" style="font-size:12px" title="Actions and consoles come back when the node is online">node ' + PM.esc(g.node) + ' offline</span>';
     const running = g.status === "running";
     const canConsole = !g.template && (g.type === "qemu" || running);
     const id = PM.esc(g.vmid);
     let html = "";
-    if (IS_ADMIN && !g.template) {
+    if (can("guest.power") && !g.template) {
       const busy = data && data.active_guest_jobs && data.active_guest_jobs[String(g.vmid)];
       if (busy) {
         html += '<button class="btn sm" data-job="' + busy + '"><span class="spin"></span> View job</button>';
@@ -417,13 +570,44 @@
           '<button class="btn sm" data-grestart="' + id + '"' + (running ? "" : " disabled") + '>Restart</button>';
       }
     }
-    if (canConsole) {
-      html += IS_ADMIN
-        ? '<button class="btn sm" data-gconsole="' + id + '" title="Signs this browser in to Proxmox as root@pam and opens the console in a new tab">Console ↗</button>'
-        : '<a class="btn sm" href="' + PM.esc(consoleUrl(g)) + '" target="_blank" rel="noopener" title="Opens the console in the Proxmox web UI (log in there)">Console ↗</a>';
+    // consoles run through the dashboard's relay (admins only, after a fresh re-auth).
+    if (canConsole && CAN_CONSOLE) {
+      html += '<button class="btn sm" data-gconsole="' + id + '" title="Opens the console in a new tab, relayed through the dashboard">Console ↗</button>';
     }
-    if (IS_ADMIN) html += '<button class="btn sm" data-gmore="' + id + '" title="Start at boot, network, snapshot, backup, expand disk">More ▾</button>';
+    if (CAN_GUEST_MORE) html += '<button class="btn sm" data-gmore="' + id + '" title="Start at boot, network, snapshot, backup, expand disk">More ▾</button>';
     return html;
+  }
+
+  // Disk column: total of every disk in the guest's config, not just the boot disk.
+  const DISK_KIND = { passthrough: "passthrough", bind: "bind mount", efi: "EFI vars", tpm: "TPM state" };
+  function diskLine(d) {
+    return d.disk + "  " + (d.size ? PM.bytes(d.size) : "-") + "  " + (d.storage || "") +
+      (d.mountpoint && d.disk !== "rootfs" ? "  " + d.mountpoint : "") + (DISK_KIND[d.kind] ? "  (" + DISK_KIND[d.kind] + ")" : "") +
+      (d.backup === false ? "  (excluded from backup)" : "");
+  }
+  function diskCell(g) {
+    if (!g.disks) {
+      const why = g.disk_count === null && g.disks === null ? "Boot disk only: the guest's disk list hasn't been read yet (or VM.Audit is missing)." : "";
+      return '<td class="num nowrap"' + (why ? ' title="' + PM.esc(why) + '"' : "") + '>' + PM.bytes(g.disk_total) + (why ? '<span class="muted">*</span>' : "") + '</td>';
+    }
+    const tip = g.disks.map(diskLine).join("\n");
+    const more = g.disk_count > 1 ? '<div class="muted disk-count">' + g.disk_count + ' disks</div>' : "";
+    return '<td class="num nowrap" title="' + PM.esc(tip) + '">' + PM.bytes(g.disk_total) + more + '</td>';
+  }
+  function renderDisks(list) {
+    const wrap = document.getElementById("gi-disks-wrap");
+    if (!list || !list.length) { wrap.style.display = "none"; return; }
+    document.querySelector("#gi-disks tbody").innerHTML = list.map(function (d) {
+      const notes = [];
+      if (DISK_KIND[d.kind]) notes.push(DISK_KIND[d.kind]);
+      if (d.mountpoint) notes.push('mounted at <span class="mono">' + PM.esc(d.mountpoint) + '</span>');
+      if (d.backup === false) notes.push('<span class="warn-text">excluded from backup</span>');
+      return '<tr><td class="mono nowrap">' + PM.esc(d.disk) + '</td>' +
+        '<td class="mono">' + PM.esc(d.storage || d.volume || "-") + '</td>' +
+        '<td class="num nowrap">' + (d.size ? PM.bytes(d.size) : '<span class="muted">-</span>') + '</td>' +
+        '<td class="muted">' + notes.join(" · ") + '</td></tr>';
+    }).join("");
+    wrap.style.display = "";
   }
 
   function renderGuests(s) {
@@ -441,14 +625,16 @@
     tb.innerHTML = rows.length ? rows.map(function (g) {
       const running = g.status === "running";
       return '<tr>' +
-        '<td class="mono">' + g.vmid + '</td>' +
+        '<td class="mono">' + PM.esc(g.vmid) + '</td>' +
         '<td>' + PM.esc(g.name) + (g.template ? ' <span class="badge">template</span>' : "") + '</td>' +
         '<td><span class="badge">' + (g.type === "qemu" ? "VM" : "LXC") + '</span></td>' +
         '<td>' + PM.esc(g.node) + '</td>' +
-        '<td><span class="badge ' + (running ? "ok" : "") + '">' + PM.esc(g.status) + '</span></td>' +
+        '<td>' + (g.node_offline
+          ? '<span class="badge warn" title="Node ' + PM.esc(g.node) + ' is offline, so the guest\'s state is unknown.' + (g.last_status ? ' Last reported: ' + PM.esc(g.last_status) + '.' : "") + '">unknown</span>'
+          : '<span class="badge ' + (running ? "ok" : "") + '">' + PM.esc(g.status) + '</span>') + '</td>' +
         '<td class="num">' + (running ? PM.pct(g.cpu_pct) + ' <span class="muted">/ ' + g.cores + 'c</span>' : '<span class="muted">-</span>') + '</td>' +
         '<td class="nowrap">' + (running ? PM.mini(g.mem_pct, 85, 95) + PM.bytes(g.mem_used) + ' <span class="muted">/ ' + PM.bytes(g.mem_total) + '</span>' : '<span class="muted">' + PM.bytes(g.mem_total) + '</span>') + '</td>' +
-        '<td class="num">' + PM.bytes(g.disk_total) + '</td>' +
+        diskCell(g) +
         '<td>' + (running ? PM.uptime(g.uptime) : '<span class="muted">-</span>') + '</td>' +
         '<td class="muted">' + PM.esc((g.tags || "").split(";").join(", ")) + '</td>' +
         '<td class="guest-actions">' + guestActions(g) + '</td>' +
@@ -461,7 +647,8 @@
     if (!s) { tb.innerHTML = ""; return; }
     document.getElementById("storage-count").textContent = s.storages.length + " (shared storage counted once)";
     tb.innerHTML = s.storages.length ? s.storages.map(function (st) {
-      return '<tr><td>' + PM.esc(st.storage) + '</td><td>' + (st.shared ? '<span class="badge info">shared</span>' : PM.esc(st.node)) + '</td>' +
+      return '<tr' + (st.node_offline ? ' class="stale" title="Node ' + PM.esc(st.node) + ' is offline: last reported figures"' : "") + '><td>' + PM.esc(st.storage) + '</td><td>' +
+        (st.shared ? '<span class="badge info">shared</span>' : PM.esc(st.node) + (st.node_offline ? ' <span class="badge warn">offline</span>' : "")) + '</td>' +
         '<td class="mono">' + PM.esc(st.plugintype) + '</td><td class="muted">' + PM.esc((st.content || "").split(",").join(", ")) + '</td>' +
         '<td class="nowrap">' + PM.mini(st.pct, 80, 90) + PM.pct(st.pct) + '</td>' +
         '<td class="num">' + PM.bytes(st.used) + '</td><td class="num">' + PM.bytes(st.total) + '</td></tr>';
@@ -486,6 +673,7 @@
     renderNodes(s);
     renderGuests(s);
     renderStorage(s);
+    renderNetwork(s);
     renderJobs(data.jobs || []);
   }
 
@@ -537,7 +725,8 @@
       const hours = document.getElementById("range").value;
       data = await PM.api("GET", "/api/hosts/" + HOST_ID + "?hours=" + hours);
       render();
-    } catch (e) { PM.toast("Failed to load: " + e.message, "bad"); }
+    } catch (e) { PM.toast("Failed to load: " + e.message, "bad"); return; }
+    loadNetwork(false);   // first load, and nodes that came online since
   }
   document.getElementById("range").addEventListener("change", load);
 
@@ -738,37 +927,84 @@
     const t = e.target.closest("[data-job]"); if (t) openJob(parseInt(t.getAttribute("data-job"), 10));
   });
 
-  // ---------- Upgrade shell and guest consoles: sign the browser in to PVE, then open the console ----------
-  // The PVE upgrade console only works with a root@pam browser session (API tokens are
-  // refused by Proxmox), and guest consoles need a browser session too. The dashboard gets a
-  // root@pam ticket server-side and the new tab posts it to the host's own login endpoint
-  // (/api2/html/access/ticket), which sets the PVEAuthCookie for that host and redirects.
-  // Then the tab goes to the console URL of the target.
-  let shellTarget = null;   // {url, what}
-  function shellUrl(node) {
-    return PVE_UI.replace(/\/+$/, "") + "/?console=upgrade&xtermjs=1&vmid=0&vmname=&node=" + encodeURIComponent(node) + "&cmd=";
-  }
-  function terminalUrl(node) {
-    return PVE_UI.replace(/\/+$/, "") + "/?console=shell&xtermjs=1&vmid=0&vmname=&node=" + encodeURIComponent(node) + "&cmd=";
-  }
+  // ---------- Consoles through the dashboard's relay ----------
+  // The dashboard signs in to the host as root@pam itself and relays the console over this
+  // site's own HTTPS connection; the browser never talks to the Proxmox host. A saved (or the
+  // host's) root password makes it one click; otherwise the password is asked once.
+  let shellTarget = null;   // {kind, node, vmid, what}
   function shellMsg(w, text) {
     try {
       w.document.title = "Proxmox console";
-      w.document.body.style.cssText = "background:#0d1117;color:#c9d1d9;font:14px system-ui,sans-serif;padding:40px";
+      const cs = getComputedStyle(document.documentElement);
+      w.document.body.style.cssText = "background:" + (cs.getPropertyValue("--bg").trim() || "#0f1419") + ";color:" +
+        (cs.getPropertyValue("--text").trim() || "#e6edf3") + ";font:14px system-ui,sans-serif;padding:40px";
       w.document.body.textContent = text;
     } catch (e) {}
   }
   function startShell(node) {
-    startConsole({ url: shellUrl(node), what: "The upgrade shell on " + node + " (" + (data ? data.name : "") + ")" });
+    startConsole({ kind: "upgrade", node: node, what: "The upgrade shell on " + node + " (" + (data ? data.name : "") + ")" });
   }
   function startTerminal(node) {
-    startConsole({ url: terminalUrl(node), what: "The terminal on " + node + " (" + (data ? data.name : "") + ")" });
+    startConsole({ kind: "shell", node: node, what: "The terminal on " + node + " (" + (data ? data.name : "") + ")" });
   }
   function startConsole(target) {
     shellTarget = target;
+    // a fresh re-auth first (the server refuses consoles without one)
+    if (!PM.stepup.active()) { askStepup(target, ""); return; }
     if (!data || !data.console_login) { askShellPassword(target, ""); return; }
     runShell(target, "", false);
   }
+  let stepupTarget = null;
+  function askStepup(target, err, loaded) {
+    stepupTarget = target;
+    if (!PM.stepup.state && !loaded) { PM.stepup.load().then(function () { askStepup(target, err, true); }); return; }
+    const st = PM.stepup.state;
+    const methods = (st && st.methods) || ["totp"];
+    if (st && !methods.length) { PM.toast(st.blocked_reason || "Consoles aren't available for your account.", "bad"); return; }
+    const entra = methods.indexOf("entra") !== -1;
+    document.getElementById("stepup-mins").textContent = st ? Math.round(st.window_minutes) : 15;
+    document.getElementById("stepup-totp").style.display = entra ? "none" : "";
+    document.getElementById("stepup-entra").style.display = entra ? "" : "none";
+    const go = document.getElementById("stepup-go");
+    go.textContent = entra ? "Sign in with Microsoft" : (data && data.console_login ? "Verify and open" : "Verify");
+    go.disabled = false;
+    document.getElementById("stepup-code").value = "";
+    const e = document.getElementById("stepup-err");
+    e.textContent = err || ""; e.style.display = err ? "" : "none";
+    PM.openModal("stepup-modal");
+    if (!entra) setTimeout(function () { document.getElementById("stepup-code").focus(); }, 50);
+  }
+  document.getElementById("stepup-go").addEventListener("click", async function () {
+    const st = PM.stepup.state;
+    if (st && (st.methods || []).indexOf("entra") !== -1) {
+      location.href = "/auth/entra/stepup?next=" + encodeURIComponent(location.pathname);
+      return;
+    }
+    const code = document.getElementById("stepup-code").value.replace(/\s/g, "");
+    const err = document.getElementById("stepup-err");
+    if (!/^\d{6}$/.test(code)) { err.textContent = "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
+    const target = stepupTarget;
+    // With a saved root password no other dialog follows, so open the tab now, inside the click.
+    const w = data && data.console_login ? window.open("about:blank", "pmconsole_" + Date.now()) : null;
+    if (data && data.console_login && !w) { PM.toast("The browser blocked the new tab. Allow pop-ups for this dashboard and try again.", "bad"); return; }
+    if (w) shellMsg(w, "Verifying …");
+    const go = this;
+    go.disabled = true;
+    try {
+      PM.stepup.set(await PM.api("POST", "/api/stepup", { code: code }));
+    } catch (e) {
+      if (w) { try { w.close(); } catch (x) {} }
+      go.disabled = false;
+      if (e.data && e.data.signed_out) { location.href = "/login"; return; }
+      err.textContent = e.message; err.style.display = "";
+      return;
+    }
+    PM.closeModal("stepup-modal");
+    if (w) runShell(target, "", false, w); else askShellPassword(target, "");
+  });
+  document.getElementById("stepup-code").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") document.getElementById("stepup-go").click();
+  });
   function askShellPassword(target, err) {
     document.getElementById("shell-what").textContent = target.what;
     document.getElementById("shell-pw").value = "";
@@ -778,83 +1014,26 @@
     PM.openModal("shell-modal");
     setTimeout(function () { document.getElementById("shell-pw").focus(); }, 50);
   }
-  // Can this browser talk to the host over TLS? A no-cors fetch fails if the host's
-  // (usually self-signed) certificate hasn't been accepted in this browser yet, or if the
-  // host is unreachable from this computer. Any HTTP answer, even 404, counts as OK.
-  function probeHost() {
-    const ctl = window.AbortController ? new AbortController() : null;
-    const timer = setTimeout(function () { if (ctl) ctl.abort(); }, 6000);
-    return fetch(PVE_UI.replace(/\/+$/, "") + "/pve2/images/logo-128.png?_=" + Date.now(),
-      { mode: "no-cors", cache: "no-store", credentials: "omit", signal: ctl ? ctl.signal : undefined })
-      .then(function () { return true; }, function () { return false; })
-      .finally(function () { clearTimeout(timer); });
-  }
-  // Post the ticket to the host's login page in the shell tab (form lives here, targets
-  // the tab by name, so it works whatever page the tab is on), wait for Proxmox to answer
-  // (it sets PVEAuthCookie and redirects), then load the console in that tab.
-  function loginAndOpen(w, name, r, target) {
-    let sameOrigin = true;
-    try { void w.location.href; } catch (e) { sameOrigin = false; }
-    const f = document.createElement("form");
-    f.method = "POST"; f.action = r.login_url; f.target = name; f.style.display = "none";
-    [["username", r.username], ["password", r.ticket]].forEach(function (kv) {
-      const i = document.createElement("input"); i.type = "hidden"; i.name = kv[0]; i.value = kv[1]; f.appendChild(i);
-    });
-    shellMsg(w, "Signing in to Proxmox as root@pam …");
-    document.body.appendChild(f); f.submit(); f.remove();
-    const openConsole = function () { if (!w.closed) w.location.href = target.url; };
-    if (!sameOrigin) { setTimeout(openConsole, 2500); return; }
-    // The tab is still our blank page until Proxmox's response arrives; reading its
-    // location starts throwing once the Proxmox page has loaded (cookie already set).
-    const t0 = Date.now();
-    (function poll() {
-      if (w.closed) return;
-      let loaded = false;
-      try { void w.location.href; } catch (e) { loaded = true; }
-      if (loaded || Date.now() - t0 > 10000) setTimeout(openConsole, 300);
-      else setTimeout(poll, 100);
-    })();
-  }
-  let certWait = null;
-  function waitForCert(w, name, r, target) {
-    document.getElementById("cert-host").textContent = PVE_UI;
-    PM.openModal("cert-modal");
-    const stop = function () { clearInterval(certWait); certWait = null; };
-    if (certWait) stop();
-    const t0 = Date.now();
-    certWait = setInterval(function () {
-      if (w.closed || !document.getElementById("cert-modal").classList.contains("open") || Date.now() - t0 > 300000) {
-        stop(); PM.closeModal("cert-modal"); return;
-      }
-      probeHost().then(function (ok) {
-        if (!ok || !certWait) return;
-        stop(); PM.closeModal("cert-modal");
-        loginAndOpen(w, name, r, target);
-      });
-    }, 2000);
-  }
-  function runShell(target, password, remember) {
-    const name = "pmshell_" + Date.now();
-    const w = window.open("about:blank", name);  // must open inside the click, or it's blocked
+  function runShell(target, password, remember, w0) {
+    const w = w0 || window.open("about:blank", "pmconsole_" + Date.now());  // must open inside the click, or it's blocked
     if (!w) { PM.toast("The browser blocked the new tab. Allow pop-ups for this dashboard and try again.", "bad"); return; }
-    shellMsg(w, "Signing in to Proxmox as root@pam …");
+    shellMsg(w, "Opening the console …");
     const go = document.getElementById("shell-go");
     go.disabled = true;
-    Promise.all([
-      PM.api("POST", "/api/hosts/" + HOST_ID + "/console-login", { password: password, remember: remember }),
-      probeHost(),
-    ]).then(function (res) {
-      const r = res[0], reachable = res[1];
+    PM.api("POST", "/api/hosts/" + HOST_ID + "/consoles", {
+      kind: target.kind, node: target.node, vmid: target.vmid != null ? Number(target.vmid) : null, password: password, remember: remember
+    }).then(function (r) {
       PM.closeModal("shell-modal");
       if (data && !!r.saved !== (data.console_login === "saved")) load();
-      if (reachable) { loginAndOpen(w, name, r, target); return; }
-      // Certificate not accepted yet (or host not reachable from this PC): show the host in
-      // the tab so the user can accept the warning; carry on by itself once it's accepted.
-      w.location.href = PVE_UI;
-      waitForCert(w, name, r, target);
+      w.location.href = r.url;
+      loadConsoles();
     }).catch(function (e) {
       try { w.close(); } catch (x) {}
-      if (e.status === 409 || e.status === 422) askShellPassword(target, e.message);
+      if (e.data && e.data.stepup_required) {
+        PM.closeModal("shell-modal");
+        PM.stepup.set(Object.assign({}, PM.stepup.state || {}, { active: false, remaining: 0, methods: e.data.methods }));
+        if (!(e.data.methods || []).length) PM.toast(e.message, "bad"); else askStepup(target, "");
+      } else if (e.status === 409 || e.status === 422) askShellPassword(target, e.message);
       else PM.toast(e.message, "bad");
     }).finally(function () { go.disabled = false; });
   }
@@ -871,6 +1050,42 @@
     try { await PM.api("DELETE", "/api/hosts/" + HOST_ID + "/console-login"); PM.toast("Saved root password removed", "ok"); load(); }
     catch (e) { PM.toast(e.message, "bad"); }
   });
+
+  // Console session log (admins)
+  const KIND_WORD = { vm: "VM console", ct: "Container console", shell: "Terminal", upgrade: "Upgrade shell" };
+  const STEPUP_WORD = { totp: "authenticator", entra: "Microsoft" };
+  function dur(a, b) {
+    if (!a) return "";
+    const s = Math.max(0, Math.round(((b ? Date.parse(b) : Date.now()) - Date.parse(a)) / 1000));
+    return s < 60 ? s + " s" : s < 3600 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
+  }
+  async function loadConsoles() {
+    const sec = document.getElementById("consoles-section");
+    if (!sec) return;
+    let rows;
+    try { rows = await PM.api("GET", "/api/hosts/" + HOST_ID + "/consoles"); } catch (e) { return; }
+    if (!rows.length) { sec.style.display = "none"; return; }
+    sec.style.display = "";
+    document.getElementById("consoles-count").textContent = rows.length;
+    const more = document.getElementById("consoles-more");
+    more.style.display = rows.length > CONSOLES_SHORT ? "" : "none";
+    more.textContent = consolesAll ? "Show fewer" : "Show all " + rows.length;
+    if (!consolesAll) rows = rows.slice(0, CONSOLES_SHORT);
+    document.querySelector("#consoles tbody").innerHTML = rows.map(function (r) {
+      const live = r.connected_at && !r.ended_at;
+      const state = live ? '<span class="badge ok">open</span>' : r.connected_at ? '<span class="muted">' + PM.esc(dur(r.connected_at, r.ended_at)) + '</span>' : '<span class="muted">not connected</span>';
+      return '<tr><td class="muted nowrap" title="' + PM.esc(r.created_at) + '">' + PM.when(r.created_at) + '</td><td>' + PM.esc(r.node) + '</td>' +
+        '<td>' + PM.esc(r.label || KIND_WORD[r.kind] || r.kind) + '</td><td class="muted">' + PM.esc(r.username) + '</td>' +
+        '<td class="mono muted">' + PM.esc(r.client_ip) + '</td><td class="muted">' + PM.esc(STEPUP_WORD[r.stepup] || r.stepup || "") + '</td>' +
+        '<td>' + state + '</td><td class="muted">' + PM.esc(r.ended_at ? r.end_reason : "") + '</td></tr>';
+    }).join("");
+  }
+  const CONSOLES_SHORT = 8;
+  let consolesAll = false;
+  if (CAN_CONSOLE) {
+    document.getElementById("consoles-more").addEventListener("click", function () { consolesAll = !consolesAll; loadConsoles(); });
+    loadConsoles(); setInterval(loadConsoles, 30000);
+  }
 
   // ---------------- Guests: power, console, More (snapshot, backup, expand disk) ----------------
   let guestCur = null;      // guest shown in the More dialog
@@ -890,7 +1105,7 @@
     return "pm-" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes());
   }
   function openGuestConsole(g) {
-    startConsole({ url: consoleUrl(g), what: "The console of " + guestLabel(g) });
+    startConsole({ kind: g.type === "qemu" ? "vm" : "ct", node: g.node, vmid: g.vmid, what: "The console of " + guestLabel(g) });
   }
   async function guestPost(g, path, body, btn, closeId) {
     PM.busy(btn, true, "Starting");
@@ -966,7 +1181,10 @@
     document.getElementById("rs-hint").textContent = g.type === "qemu"
       ? "Proxmox only grows the virtual disk. Afterwards extend the partition and filesystem inside the guest (Linux: growpart + resize2fs or xfs_growfs; Windows: Disk Management > Extend Volume). Disks can't be shrunk again."
       : "Proxmox grows the container's filesystem too. Disks can't be shrunk again.";
-    loadBackupStorages(g);
+    document.querySelectorAll("#guest-modal [data-cap]").forEach(function (el) {
+      el.style.display = can(el.getAttribute("data-cap")) ? "" : "none";
+    });
+    if (can("guest.backup")) loadBackupStorages(g);
     loadGuestDetails(g);
     PM.openModal("guest-modal");
   }
@@ -1016,7 +1234,7 @@
     if (st.order != null) extra.push("boot order " + st.order);
     if (st.up != null) extra.push("waits " + st.up + " s after starting");
     if (st.down != null) extra.push("shutdown timeout " + st.down + " s");
-    const canToggle = IS_ADMIN && guestCur && !guestCur.template;
+    const canToggle = can("guest.onboot") && guestCur && !guestCur.template;
     document.getElementById("gi-boot").innerHTML = '<span>Start at boot:</span>' +
       (d.onboot ? '<span class="badge ok" id="ob-state">On</span>' : '<span class="badge" id="ob-state">Off</span>') +
       (canToggle ? '<button class="btn sm" id="ob-toggle" title="Changes onboot in the guest\'s Proxmox config; nothing restarts">' + (d.onboot ? "Turn off" : "Turn on") + '</button>' : "") +
@@ -1093,10 +1311,12 @@
     document.getElementById("gi-boot").innerHTML = '<span class="muted">Loading…</span>';
     document.getElementById("ob-confirm").style.display = "none"; bootCur = null;
     document.getElementById("gi-nets-wrap").style.display = "none"; gst.textContent = "";
+    document.getElementById("gi-disks-wrap").style.display = "none";
     try {
       const r = await PM.api("GET", guestBase(g) + "/details");
       if (guestCur !== g) return;
       renderBoot(r);
+      renderDisks(r.disk_list || []);
       renderNets(g, r.nets || []);
       if (g.template) { sel.innerHTML = ""; rst.textContent = "Templates can't be expanded; expand the clone instead."; }
       else {
@@ -1172,6 +1392,7 @@
     if (t.hasAttribute("data-switch-repos")) { openConfirm("switch-repos", t.getAttribute("data-switch-repos")); return; }
     if (t.hasAttribute("data-refresh-pkgs")) { startCheck(t.getAttribute("data-refresh-pkgs"), t, "refresh-packages"); return; }
     if (t.hasAttribute("data-job")) { openJob(parseInt(t.getAttribute("data-job"), 10)); return; }
+    if (t.hasAttribute("data-copy-ip")) { PM.copy(t.getAttribute("data-copy-ip"), "IP address"); return; }
     if (t.hasAttribute("data-toggle-disks")) {
       const node = t.getAttribute("data-toggle-disks");
       openNodes[node] = !openNodes[node];
@@ -1213,6 +1434,13 @@
       }
       renderNodes(data.summary);
     }
+  });
+
+  document.getElementById("network-refresh").addEventListener("click", async function () {
+    const btn = this;
+    PM.busy(btn, true, "Reading");
+    await loadNetwork(true);
+    PM.busy(btn, false);
   });
 
   document.getElementById("refresh").addEventListener("click", async function () {

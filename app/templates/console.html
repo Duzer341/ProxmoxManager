@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en" data-theme="{{ theme or 'dark' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ label }} - Proxmox Manager</title>
+  <link rel="stylesheet" href="/static/app.css?v={{ app_version }}">
+  {% if xterm %}<link rel="stylesheet" href="/static/vendor/xterm-5.5.0.css">{% endif %}
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e57000'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EPM%3C/text%3E%3C/svg%3E">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body.console-page { display: flex; flex-direction: column; background: #000; }
+    .console-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--bg-elev); border-bottom: 1px solid var(--border); font-size: 13px; }
+    .console-bar .label { font-weight: 600; }
+    .console-bar .spacer { flex: 1; }
+    #console-status.bad { color: var(--bad); }
+    #console-status.ok { color: var(--ok); }
+    #screen { flex: 1; min-height: 0; overflow: hidden; background: #000; }
+    .console-rec { font-size: 11.5px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--border); color: var(--muted); }
+    #console-warn { display: none; align-items: center; gap: 10px; padding: 6px 12px; font-size: 13px; background: var(--bg-elev); border-bottom: 1px solid var(--border); }
+    #console-warn.show { display: flex; }
+    #screen.term { padding: 4px 6px; }
+    #paste-bar { display: none; align-items: center; gap: 10px; padding: 6px 12px; font-size: 13px; background: var(--bg-elev); border-bottom: 1px solid var(--border); }
+    #paste-bar.show { display: flex; }
+    #paste-text { width: 100%; min-height: 140px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+    #paste-secret { width: 100%; }
+  </style>
+</head>
+<body class="console-page">
+  <div class="console-bar">
+    <span class="logo" style="width:16px; height:16px; border-radius:4px; background:var(--accent); display:inline-block"></span>
+    <span class="label" id="console-label">{{ label }}</span>
+    <span class="muted" id="console-status">Starting…</span>
+    <span class="console-rec" title="Who opened this console, from where, when and for how long is logged. The screen is not recorded.">Access is logged</span>
+    <span class="spacer"></span>
+    <span class="muted" id="console-limit" style="font-size:12px"></span>
+    {% if not xterm %}<button class="btn sm" id="paste-open" disabled title="Type text into the VM as keystrokes">Paste text</button>
+    <button class="btn sm" id="cad" disabled title="Send Ctrl+Alt+Del to the VM">Ctrl+Alt+Del</button>{% endif %}
+    <button class="btn sm" id="reconnect" style="display:none">Reconnect</button>
+    <button class="btn sm" id="close-tab">Close</button>
+  </div>
+  <div id="console-warn"><span id="console-warn-text"></span><button class="btn sm primary" id="console-stay" style="display:none">Stay connected</button></div>
+  {% if not xterm %}<div id="paste-bar"><span id="paste-progress"></span><span class="spacer" style="flex:1"></span><button class="btn sm" id="paste-stop">Stop typing</button></div>{% endif %}
+  <div id="screen" class="{{ 'term' if xterm else 'vnc' }}" tabindex="-1"></div>
+{% if not xterm %}
+<div class="modal-bg" id="paste-modal">
+  <div class="modal" style="max-width:520px">
+    <h2>Paste text into the VM</h2>
+    <p class="muted" style="margin-top:0; font-size:13px">The text is typed into the VM key by key, wherever its cursor is, as if on a US keyboard. Click
+      into the right field in the VM first. New lines press Enter. Letters, digits and the usual symbols only; up to {{ paste_max }} characters.</p>
+    <div class="field" id="paste-plain">
+      <label for="paste-text">Text</label>
+      <textarea id="paste-text" maxlength="{{ paste_max }}" spellcheck="false" autocomplete="off"></textarea>
+    </div>
+    <div class="field" id="paste-hidden" style="display:none">
+      <label for="paste-secret">Text (hidden)</label>
+      <input type="password" id="paste-secret" maxlength="{{ paste_max }}" autocomplete="off">
+    </div>
+    <div class="field inline"><input type="checkbox" id="paste-hide"><label for="paste-hide">Hide the text (one line, for passwords)</label></div>
+    <div class="field inline"><input type="checkbox" id="paste-enter"><label for="paste-enter">Press Enter after the text</label></div>
+    <div class="foot">
+      <span class="status muted" id="paste-status">Who pasted and how many characters is logged, never the text.</span>
+      <button class="btn" type="button" id="paste-cancel">Cancel</button>
+      <button class="btn primary" type="button" id="paste-send">Type it</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<script src="/static/app.js?v={{ app_version }}"></script>
+{% if xterm %}
+<script src="/static/vendor/xterm-5.5.0.js"></script>
+<script src="/static/vendor/xterm-addon-fit-0.10.0.js"></script>
+{% else %}
+<script src="/static/vendor/novnc-rfb-1.6.0.min.js"></script>
+{% endif %}
+<script nonce="{{ csp_nonce }}">
+(function () {
+  const SID = {{ sid | tojson }};
+  const KIND = {{ kind | tojson }};
+  const screen = document.getElementById("screen");
+  const statusEl = document.getElementById("console-status");
+  const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/console/" + encodeURIComponent(SID) + "/ws";
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text; statusEl.className = kind || "muted";
+    if (text === "Connected") watchLimits();
+  }
+
+  // ---- idle close and time limit (server decides; this shows the countdowns) ----
+  let lim = null, limAt = 0, limTimer = null, limPoll = null, isEnded = false;
+  function fmt(s) { s = Math.max(0, Math.round(s)); return s >= 120 ? Math.round(s / 60) + " min" : s + " s"; }
+  async function pollLimits() {
+    if (isEnded) return;
+    try { lim = await PM.api("GET", "/api/consoles/" + encodeURIComponent(SID) + "/status"); limAt = Date.now(); }
+    catch (e) { lim = null; }
+    showLimits();
+  }
+  function showLimits() {
+    const warn = document.getElementById("console-warn"), wt = document.getElementById("console-warn-text"), stay = document.getElementById("console-stay");
+    const lab = document.getElementById("console-limit");
+    if (isEnded || !lim || lim.finished || lim.idle_remaining == null) { warn.classList.remove("show"); lab.textContent = ""; return; }
+    const el = (Date.now() - limAt) / 1000;
+    const idle = lim.idle_remaining - el, max = lim.max_remaining - el;
+    lab.textContent = "closes after " + fmt(lim.idle_limit) + " idle · at most " + fmt(max) + " left";
+    if (idle <= 60) {
+      wt.textContent = "No activity: this console closes in " + fmt(idle) + ".";
+      stay.style.display = ""; warn.classList.add("show");
+    } else if (max <= 300) {
+      wt.textContent = "This console reaches its time limit in " + fmt(max) + ". Reconnect afterwards if you need more time (you may be asked to verify again).";
+      stay.style.display = "none"; warn.classList.add("show");
+    } else warn.classList.remove("show");
+  }
+  function watchLimits() {
+    if (limPoll) return;
+    pollLimits();
+    limPoll = setInterval(pollLimits, 10000);
+    limTimer = setInterval(showLimits, 1000);
+  }
+  document.getElementById("console-stay").addEventListener("click", async function () {
+    try { lim = await PM.api("POST", "/api/consoles/" + encodeURIComponent(SID) + "/keepalive"); limAt = Date.now(); showLimits(); }
+    catch (e) { setStatus(e.message, "bad"); }
+    if (window.pmConsole && window.pmConsole.focus) window.pmConsole.focus();
+    else if (window.pmConsole && window.pmConsole.term) window.pmConsole.term.focus();
+  });
+
+  function ended(text, bad) {
+    const wasConnected = lim != null;
+    isEnded = true; clearInterval(limPoll); clearInterval(limTimer);
+    document.getElementById("console-warn").classList.remove("show");
+    document.getElementById("console-limit").textContent = "";
+    setStatus(text, bad ? "bad" : "muted");
+    // noVNC doesn't pass on the close reason; ask the dashboard why (idle, time limit, ...)
+    if (KIND === "vm" && wasConnected) {
+      setTimeout(function () {
+        PM.api("GET", "/api/consoles/" + encodeURIComponent(SID) + "/status").then(function (st) {
+          if (st && st.end_reason) setStatus(text + ": " + st.end_reason, bad ? "bad" : "muted");
+        }).catch(function () {});
+      }, 600);
+    }
+    document.getElementById("reconnect").style.display = "";
+    const cad = document.getElementById("cad"); if (cad) cad.disabled = true;
+    const po = document.getElementById("paste-open"); if (po) po.disabled = true;
+  }
+  document.getElementById("close-tab").addEventListener("click", function () { window.close(); });
+  document.getElementById("reconnect").addEventListener("click", async function () {
+    const btn = this;
+    PM.busy(btn, true, "Reconnecting");
+    try { const r = await PM.api("POST", "/api/consoles/" + encodeURIComponent(SID) + "/reconnect"); location.href = r.url; }
+    catch (e) {
+      PM.busy(btn, false);
+      if (e.data && e.data.stepup_required) setStatus("Your console access ran out. Go back to the host page and open the console again to verify.", "bad");
+      else setStatus(e.message, "bad");
+    }
+  });
+
+  function vnc(password) {
+    const RFB = window.noVNC && window.noVNC.default;
+    if (!RFB) { ended("The VNC viewer failed to load.", true); return; }
+    const rfb = new RFB(screen, wsUrl, { credentials: { password: password }, wsProtocols: ["binary"] });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+    rfb.background = "#000";
+    let connected = false;
+    rfb.addEventListener("connect", function () {
+      connected = true;
+      setStatus("Connected", "ok");
+      document.getElementById("cad").disabled = false;
+      document.getElementById("paste-open").disabled = false;
+      rfb.focus();
+    });
+    rfb.addEventListener("credentialsrequired", function () { rfb.sendCredentials({ password: password }); });
+    rfb.addEventListener("securityfailure", function (e) { ended("VNC sign-in failed: " + ((e.detail && e.detail.reason) || "refused"), true); });
+    // the tab keeps the dashboard's title (guest, node, node name, host) rather than the VNC desktop name.
+    rfb.addEventListener("disconnect", function (e) {
+      ended(connected ? (e.detail && e.detail.clean ? "Disconnected" : "Connection lost") : "Could not connect to the console", !(e.detail && e.detail.clean));
+    });
+    document.getElementById("cad").addEventListener("click", function () { rfb.sendCtrlAltDel(); rfb.focus(); });
+    window.pmConsole = rfb;
+    pasteSetup(rfb);
+  }
+
+  // ---- paste as keystrokes (VM consoles) ----
+  // US layout: character -> [KeyboardEvent.code, needs Shift]. noVNC sends the code as a QEMU extended key
+  // event (a physical key), so the guest types what that key gives on its layout.
+  const US_KEYS = (function () {
+    const m = {};
+    "abcdefghijklmnopqrstuvwxyz".split("").forEach(function (c) { m[c] = ["Key" + c.toUpperCase(), false]; m[c.toUpperCase()] = ["Key" + c.toUpperCase(), true]; });
+    "0123456789".split("").forEach(function (d) { m[d] = ["Digit" + d, false]; });
+    ")!@#$%^&*(".split("").forEach(function (c, i) { m[c] = ["Digit" + i, true]; });
+    [["Minus", "-", "_"], ["Equal", "=", "+"], ["BracketLeft", "[", "{"], ["BracketRight", "]", "}"], ["Backslash", "\\", "|"],
+     ["Semicolon", ";", ":"], ["Quote", "'", '"'], ["Backquote", "`", "~"], ["Comma", ",", "<"], ["Period", ".", ">"], ["Slash", "/", "?"]]
+      .forEach(function (k) { m[k[1]] = [k[0], false]; m[k[2]] = [k[0], true]; });
+    m[" "] = ["Space", false];
+    return m;
+  })();
+  const XK = { shift: 0xffe1, enter: 0xff0d, tab: 0xff09 };
+  const PASTE_MAX = {{ paste_max }};
+  // characters word processors and chat apps put in copied text
+  const LOOKALIKE = { "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2013": "-", "\u2014": "-",
+                      "\u2212": "-", "\u00a0": " ", "\u2009": " ", "\u202f": " ", "\u2026": "...", "\u00ad": "" };
+
+  function pasteKeys(text) {
+    // -> {keys: [[keysym, code, shift]], chars, lines, skipped}
+    text = text.replace(/\r\n?/g, "\n").replace(/[\u2018\u2019\u201a\u201c\u201d\u201e\u2013\u2014\u2212\u00a0\u2009\u202f\u2026\u00ad]/g, function (c) { return LOOKALIKE[c]; });
+    const keys = []; let skipped = 0, lines = 0;
+    for (const ch of text) {
+      if (ch === "\n") { keys.push([XK.enter, "Enter", false]); lines++; continue; }
+      if (ch === "\t") { keys.push([XK.tab, "Tab", false]); continue; }
+      const k = US_KEYS[ch];
+      if (!k) { skipped++; continue; }
+      keys.push([ch.charCodeAt(0), k[0], k[1]]);
+    }
+    return { keys: keys, chars: keys.length, lines: lines, skipped: skipped };
+  }
+
+  function pasteSetup(rfb) {
+    const $ = function (id) { return document.getElementById(id); };
+    const modal = $("paste-modal"), bar = $("paste-bar"), prog = $("paste-progress");
+    let typing = null;
+    function value() { return $("paste-hide").checked ? $("paste-secret").value : $("paste-text").value; }
+    function open() {
+      $("paste-status").className = "status muted";
+      $("paste-status").textContent = "Who pasted and how many characters is logged, never the text.";
+      modal.classList.add("open");
+      ($("paste-hide").checked ? $("paste-secret") : $("paste-text")).focus();
+    }
+    function close() { modal.classList.remove("open"); $("paste-text").value = ""; $("paste-secret").value = ""; rfb.focus(); }
+    $("paste-open").addEventListener("click", function () { if (!typing) open(); });
+    $("paste-cancel").addEventListener("click", close);
+    modal.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
+    $("paste-hide").addEventListener("change", function () {
+      const hide = this.checked;
+      $("paste-plain").style.display = hide ? "none" : ""; $("paste-hidden").style.display = hide ? "" : "none";
+      if (hide) { $("paste-secret").value = $("paste-text").value.split(/\r?\n/)[0]; $("paste-text").value = ""; $("paste-secret").focus(); }
+      else { $("paste-text").value = $("paste-secret").value; $("paste-secret").value = ""; $("paste-text").focus(); }
+    });
+    $("paste-secret").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("paste-send").click(); } });
+    $("paste-stop").addEventListener("click", function () { if (typing) typing.stop = true; });
+    $("paste-send").addEventListener("click", async function () {
+      const p = pasteKeys(value());
+      if ($("paste-enter").checked) { p.keys.push([XK.enter, "Enter", false]); p.lines++; p.chars++; }
+      const st = $("paste-status");
+      if (!p.keys.length) { st.className = "status bad-text"; st.textContent = p.skipped ? "None of these characters can be typed." : "Enter some text first."; return; }
+      if (p.keys.length > PASTE_MAX) { st.className = "status bad-text"; st.textContent = "That's more than " + PASTE_MAX + " keys."; return; }
+      const btn = this;
+      PM.busy(btn, true, "Starting");
+      try {
+        await PM.api("POST", "/api/consoles/" + encodeURIComponent(SID) + "/paste", { chars: p.chars, lines: p.lines, skipped: p.skipped });
+      } catch (e) {
+        PM.busy(btn, false); st.className = "status bad-text"; st.textContent = e.message; return;
+      }
+      PM.busy(btn, false);
+      close();
+      typing = { stop: false };
+      $("paste-open").disabled = true;
+      prog.textContent = "Typing into the VM… 0 / " + p.keys.length;
+      bar.classList.add("show");
+      const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+      let n = 0;
+      for (const k of p.keys) {
+        if (typing.stop || isEnded) break;
+        if (k[2]) rfb.sendKey(XK.shift, "ShiftLeft", true);
+        rfb.sendKey(k[0], k[1], true);
+        rfb.sendKey(k[0], k[1], false);
+        if (k[2]) rfb.sendKey(XK.shift, "ShiftLeft", false);
+        n++;
+        if (n % 10 === 0 || n === p.keys.length) prog.textContent = "Typing into the VM… " + n + " / " + p.keys.length;
+        await sleep(k[0] === XK.enter ? 120 : 15);
+      }
+      const why = typing.stop ? "Stopped after " + n + " of " + p.keys.length + " keys." : isEnded ? "The console closed while typing." : "";
+      typing = null;
+      bar.classList.remove("show");
+      document.body.dataset.pasteRuns = String(Number(document.body.dataset.pasteRuns || 0) + 1);
+      if (!isEnded) $("paste-open").disabled = false;
+      if (why || p.skipped) setStatus((why ? why + " " : "Typed. ") + (p.skipped ? p.skipped + " character(s) couldn't be typed and were left out." : ""), why ? "bad" : "ok");
+      else setStatus("Connected", "ok");
+      rfb.focus();
+    });
+  }
+
+  function term() {
+    if (!window.Terminal || !window.FitAddon) { ended("The terminal failed to load.", true); return; }
+    const t = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace",
+      theme: { background: "#000000" } });
+    const fit = new FitAddon.FitAddon();
+    t.loadAddon(fit);
+    t.open(screen);
+    fit.fit();
+    const enc = new TextEncoder();
+    const ws = new WebSocket(wsUrl, "binary");
+    ws.binaryType = "arraybuffer";
+    let ping = null, opened = false;
+    const send = function (s) { if (ws.readyState === 1) ws.send(s); };
+    // termproxy protocol: 0:<bytes>:<data> input, 1:<cols>:<rows>: resize, 2 keep-alive
+    const sendInput = function (d) { send("0:" + enc.encode(d).length + ":" + d); };
+    const sendSize = function () { send("1:" + t.cols + ":" + t.rows + ":"); };
+    ws.onopen = function () {
+      opened = true;
+      setStatus("Connected", "ok");
+      sendSize();
+      t.focus();
+      ping = setInterval(function () { send("2"); }, 30000);
+    };
+    ws.onmessage = function (ev) { t.write(typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data)); };
+    ws.onclose = function (ev) {
+      clearInterval(ping);
+      ended(ev.reason ? ev.reason : opened ? "Disconnected" : "Could not connect to the console", !opened || ev.code !== 1000);
+    };
+    t.onData(sendInput);
+    t.onBinary(sendInput);
+    t.onResize(sendSize);
+    window.addEventListener("resize", function () { try { fit.fit(); } catch (e) {} });
+    window.pmConsole = { term: t, ws: ws };
+  }
+
+  (async function () {
+    let r;
+    try { r = await PM.api("POST", "/api/consoles/" + encodeURIComponent(SID) + "/start"); }
+    catch (e) { ended(e.message, true); return; }
+    setStatus("Connecting…");
+    if (KIND === "vm") vnc(r.password); else term();
+  })();
+})();
+</script>
+</body>
+</html>
