@@ -189,7 +189,14 @@
   };
   PM.closeModal = function (id) { document.getElementById(id).classList.remove("open"); };
   document.addEventListener("click", function (e) {
-    if (e.target.classList && e.target.classList.contains("modal-bg")) e.target.classList.remove("open");
+    // a form dialog marked data-keep-open (Add / Edit host) only closes with its own buttons, so a stray
+    // click outside it doesn't throw away what was typed. The dialog gives a short nudge instead.
+    if (e.target.classList && e.target.classList.contains("modal-bg")) {
+      if (e.target.hasAttribute("data-keep-open")) {
+        const box = e.target.querySelector(".modal");
+        if (box) { box.classList.remove("nudge"); void box.offsetWidth; box.classList.add("nudge"); }
+      } else e.target.classList.remove("open");
+    }
     const closer = e.target.closest && e.target.closest("[data-close]");
     if (closer) PM.closeModal(closer.getAttribute("data-close"));
   });
@@ -197,7 +204,7 @@
     if (e.key !== "Escape") return;
     let top = null;   // close only the top dialog (one opened over another goes first)
     document.querySelectorAll(".modal-bg.open").forEach(function (m) { if (!top || (+m.style.zIndex || 50) >= (+top.style.zIndex || 50)) top = m; });
-    if (top) top.classList.remove("open");
+    if (top && !top.hasAttribute("data-keep-open")) top.classList.remove("open");
   });
 
   PM.busy = function (btn, on, label) {

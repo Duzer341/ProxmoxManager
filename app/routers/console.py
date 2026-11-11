@@ -338,7 +338,7 @@ def console_keepalive(sid: str, request: Request, user: User = Depends(require_c
     return consoles.public_status(s)
 
 
-PASTE_MAX_CHARS = 5000
+PASTE_MAX_CHARS = 10000
 
 
 class PasteIn(BaseModel):

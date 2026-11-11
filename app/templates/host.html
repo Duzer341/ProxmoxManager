@@ -258,7 +258,7 @@
     </div>
   </h2>
   <div class="card table-wrap" style="padding:0"><table id="guests"><thead><tr>
-    <th>VMID</th><th>Name</th><th>Type</th><th>Node</th><th>Status</th><th class="num">CPU</th><th>RAM</th><th class="num">Disk</th><th>Uptime</th><th>Tags</th><th></th>
+    <th data-gsort="vmid">VMID</th><th data-gsort="name">Name</th><th data-gsort="type">Type</th><th data-gsort="node">Node</th><th data-gsort="status">Status</th><th class="num" data-gsort="cpu">CPU</th><th data-gsort="ram">RAM</th><th class="num" data-gsort="disk">Disk</th><th data-gsort="uptime">Uptime</th><th data-gsort="tags">Tags</th><th></th>
   </tr></thead><tbody></tbody></table></div>
 </div>
 
@@ -715,6 +715,57 @@
     wrap.style.display = "";
   }
 
+  // click a column header to sort the guests (again to reverse). Remembered in this browser.
+  const GSORT_NUM = { vmid: 1, cpu: 1, ram: 1, disk: 1, uptime: 1 };
+  const GSORT_DESC_FIRST = { cpu: 1, ram: 1, disk: 1, uptime: 1 };   // biggest first on the first click
+  let gsort = { key: "vmid", dir: 1 };
+  try { const v = JSON.parse(localStorage.getItem("pm.guestSort") || "null"); if (v && v.key && (v.dir === 1 || v.dir === -1)) gsort = v; } catch (e) { /* default */ }
+  function gsortVal(g, key) {
+    const running = g.status === "running" && !g.node_offline;
+    switch (key) {
+      case "vmid": return Number(g.vmid) || 0;
+      case "name": return g.name || "";
+      case "type": return g.type === "qemu" ? "VM" : "LXC";
+      case "node": return g.node || "";
+      case "status": return g.node_offline ? "unknown" : (g.status || "");
+      case "cpu": return running ? (g.cpu_pct || 0) : -1;
+      case "ram": return running ? (g.mem_used || 0) : -1;
+      case "disk": return g.disk_total || 0;
+      case "uptime": return running ? (g.uptime || 0) : -1;
+      case "tags": return (g.tags || "").split(";").join(", ");
+    }
+    return "";
+  }
+  function sortGuests(rows) {
+    const key = gsort.key, dir = gsort.dir, num = GSORT_NUM[key];
+    rows.sort(function (a, b) {
+      const x = gsortVal(a, key), y = gsortVal(b, key);
+      let c = num ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: "base" });
+      if (!num && (x === "") !== (y === "")) return x === "" ? 1 : -1;   // empty (no tags) last either way
+      if (c === 0) c = (Number(a.vmid) || 0) - (Number(b.vmid) || 0);
+      else c *= dir;
+      return c;
+    });
+    document.querySelectorAll("#guests th[data-gsort]").forEach(function (th) {
+      const on = th.getAttribute("data-gsort") === key;
+      th.classList.toggle("sorted", on);
+      th.setAttribute("aria-sort", on ? (dir === 1 ? "ascending" : "descending") : "none");
+      th.setAttribute("data-dir", on ? (dir === 1 ? "asc" : "desc") : "");
+    });
+  }
+  document.querySelectorAll("#guests th[data-gsort]").forEach(function (th) {
+    th.tabIndex = 0;
+    th.title = "Sort by " + th.textContent.trim().toLowerCase();
+    const go = function () {
+      const key = th.getAttribute("data-gsort");
+      gsort = gsort.key === key ? { key: key, dir: -gsort.dir } : { key: key, dir: GSORT_DESC_FIRST[key] ? -1 : 1 };
+      try { localStorage.setItem("pm.guestSort", JSON.stringify(gsort)); } catch (e) { /* not remembered */ }
+      renderGuests(data && data.summary);
+    };
+    th.addEventListener("click", go);
+    th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  });
+
   function renderGuests(s) {
     const tb = document.querySelector("#guests tbody");
     if (!s) { tb.innerHTML = ""; return; }
@@ -726,6 +777,7 @@
       if (q && (String(g.vmid) + " " + g.name + " " + g.node + " " + g.tags).toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
+    sortGuests(rows);
     document.getElementById("guest-count").textContent = rows.length + " of " + s.guests.length;
     tb.innerHTML = rows.length ? rows.map(function (g) {
       const running = g.status === "running";

@@ -266,7 +266,7 @@
         if (k[2]) rfb.sendKey(XK.shift, "ShiftLeft", false);
         n++;
         if (n % 10 === 0 || n === p.keys.length) prog.textContent = "Typing into the VM… " + n + " / " + p.keys.length;
-        await sleep(k[0] === XK.enter ? 120 : 15);
+        await sleep(k[0] === XK.enter ? 140 : 18);   // 18 ms per key: faster drops the odd character
       }
       const why = typing.stop ? "Stopped after " + n + " of " + p.keys.length + " keys." : isEnded ? "The console closed while typing." : "";
       typing = null;

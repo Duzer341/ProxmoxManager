@@ -569,3 +569,17 @@ input[type=date], input[type=time], input[type=datetime-local], select, textarea
 /* confirm a certificate / SSH host key before credentials are sent */
 .confirm-box { border: 1px solid var(--warn); border-radius: var(--radius); padding: 10px 12px; margin: 10px 0; font-size: 12.5px; line-height: 1.55; }
 .confirm-box .fp { font-size: 12.5px; font-weight: 600; word-break: break-all; margin: 4px 0; }
+
+/* a click outside a dialog that only closes with its buttons (Add / Edit host) */
+@keyframes modal-nudge { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-6px); } 75% { transform: translateX(6px); } }
+.modal.nudge { animation: modal-nudge .25s ease-in-out; }
+@media (prefers-reduced-motion: reduce) { .modal.nudge { animation: none; outline: 2px solid var(--accent); } }
+
+/* sortable guest table headers */
+th[data-gsort] { cursor: pointer; user-select: none; }
+th[data-gsort]:hover, th[data-gsort]:focus-visible { color: var(--text); }
+th[data-gsort]::after { content: ""; display: inline-block; width: 1em; margin-left: 3px; opacity: .35; font-size: 10px; }
+th[data-gsort]:hover::after { content: "\25B4\25BE"; letter-spacing: -2px; }
+th[data-gsort].sorted { color: var(--text); }
+th[data-gsort].sorted[data-dir="asc"]::after { content: "\25B2"; opacity: .9; letter-spacing: 0; }
+th[data-gsort].sorted[data-dir="desc"]::after { content: "\25BC"; opacity: .9; letter-spacing: 0; }

@@ -618,7 +618,7 @@ as a US keyboard would send them (QEMU extended key events, physical keys), so a
 another layout types what those keys give there. Letters, digits, space and the US-keyboard
 symbols are typed; curly quotes, dashes and non-breaking spaces copied from Word or Teams are
 typed as their plain versions; anything else (accented letters, emoji) is left out and the
-console bar says how many. Up to 5000 characters, about 60 per second, with *Stop typing*.
+console bar says how many. Up to 10000 characters, about 50 per second (10000 take about 3.5 minutes), with *Stop typing*.
 The event log records `console.paste` with the console and the number of characters and
 lines; the text itself is never sent to the dashboard or stored. Terminals (node shell, containers)
 take a normal paste (Ctrl+Shift+V or right-click) and have no *Paste text* button.
@@ -729,7 +729,8 @@ name. The page refreshes from the cache every 30 seconds. *Refresh* polls a sing
 immediately; *Refresh all* starts a full poll cycle.
 
 **Host page.** Summary tiles, utilization history, one section per node with update and
-reboot-pending status and maintenance actions, followed by the guest table, storage table,
+reboot-pending status and maintenance actions, followed by the guest table (click a column header to sort by it, again to reverse; CPU, RAM, disk and
+uptime sort biggest first; the choice is remembered in that browser), storage table,
 network table and recent jobs. *Disks / SMART* lists a node's physical disks; *Scan* reads SMART for one disk and
 *Scan all disks* for the whole node. *Details* shows the ATA attribute table or the raw
 `smartctl` output for NVMe and SAS devices. SMART data is read through
@@ -773,7 +774,8 @@ selection is remembered in that browser, the search box matches tags too, and a 
 page header opens the dashboard filtered by it. Every role sees tags; only admins change them
 (changes are in the event log as `host.update`, field `tags`).
 
-**Hosts** (admin). Add, edit, test, disable and delete hosts. *Web UI link override* sets the
+**Hosts** (admin). Add, edit, test, disable and delete hosts. The Add / Edit host window only closes with
+*Cancel* or *Save*: a click outside it or Escape doesn't throw away what was typed. *Web UI link override* sets the
 address used for links to the Proxmox UI when it differs from the address the dashboard
 polls, for example an address reachable over VPN (not used with `PM_SHOW_PVE_LINKS=false`).
 
