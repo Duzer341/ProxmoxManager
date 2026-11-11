@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import socket
@@ -301,8 +302,8 @@ def _api_refresh_packages(ctx: _Ctx) -> dict[str, Any]:
             ctx.append(f"    {u['package']}: {u['old'] or '(new)'} -> {u['new']}\n")
         if kernel:
             ctx.log("A kernel update is included - a reboot will be needed after upgrading.")
-        ctx.log("To install: use 'Update node (SSH)'." if ctx.host.ssh_enabled
-                else "To install: use 'Upgrade shell' on this node (runs pveupgrade in the Proxmox web UI).")
+        ctx.log("To install: use 'Update node' on this node (update agent)"
+                + (", or 'Update node (SSH)'." if ctx.host.ssh_enabled else "."))
     else:
         ctx.log("System is up to date.")
     ctx.flush()
@@ -635,7 +636,106 @@ def _api_guest_onboot(ctx: _Ctx) -> dict[str, Any]:
     return {"vmid": vmid, "type": gtype, "onboot": after, "onboot_before": before, "changed": True}
 
 
+# --------------------------------------------------------------------------- #
+# install updates through the update agent (no SSH, no root password)
+# --------------------------------------------------------------------------- #
+
+AGENT_PICKUP_TIMEOUT = int(os.environ.get("PM_AGENT_PICKUP_TIMEOUT", "90"))   # the agent checks every ~10 s
+AGENT_UPGRADE_TIMEOUT = 90 * 60
+
+
+def _agent_upgrade(ctx: _Ctx) -> dict[str, Any]:
+    from . import agent
+
+    api = pve_connect(ctx.host)
+    ctx.log(f"Asking the update agent on {ctx.node} to install the pending updates "
+            f"(signed request in the node's notes, API: PUT /nodes/{ctx.node}/config) ...")
+    try:
+        # make sure the agent's output can be read BEFORE asking it to install anything (Sys.Syslog)
+        agent.read(api, ctx.node, "0" * 24, limit=1)
+        rid = agent.send(api, ctx.node, "upgrade")
+    except agent.AgentError as exc:
+        raise RuntimeError(str(exc)) from exc
+    ctx.log(f"Request {rid} sent; waiting for the agent to pick it up (it checks every ~10 s) ...")
+    ctx.flush()
+    shown = 0
+    accepted = False
+    result: dict[str, str] | None = None
+    api_down_since = 0.0
+    start = time.monotonic()
+    while True:
+        time.sleep(3)
+        try:
+            lines = agent.read(api, ctx.node, rid)
+            if api_down_since:
+                ctx.log("The Proxmox API answers again.")
+                api_down_since = 0.0
+        except agent.AgentError as exc:
+            if "Sys.Syslog" in str(exc):
+                raise RuntimeError(str(exc)) from exc
+            if not api_down_since:
+                api_down_since = time.monotonic()
+                ctx.log("The Proxmox API isn't answering (its services restart during some upgrades); still waiting ...")
+            lines = []
+        except Exception:  # noqa: BLE001
+            if not api_down_since:
+                api_down_since = time.monotonic()
+                ctx.log("The Proxmox API isn't answering (its services restart during some upgrades); still waiting ...")
+            lines = []
+            try:
+                api = pve_connect(ctx.host)
+            except Exception:  # noqa: BLE001
+                pass
+        for line in lines[shown:]:
+            if line.startswith("accepted "):
+                accepted = True
+                ctx.log(f"The agent accepted the request ({line[len('accepted '):]}).")
+                continue
+            res = agent.parse_result(line)
+            if res is not None:
+                result = res
+                continue
+            ctx.append("    " + line + "\n")
+        shown = max(shown, len(lines))
+        ctx.flush()
+        if result is not None:
+            break
+        waited = time.monotonic() - start
+        if not accepted and waited > AGENT_PICKUP_TIMEOUT:
+            agent._cleanup_request(api, ctx.node)
+            raise RuntimeError(f"The update agent on {ctx.node} didn't pick up the request within {AGENT_PICKUP_TIMEOUT} s. "
+                               "Is it installed and running there? (systemctl status pmm-agent; journalctl -u pmm-agent)")
+        if waited > AGENT_UPGRADE_TIMEOUT:
+            raise RuntimeError(f"No result from the agent after {AGENT_UPGRADE_TIMEOUT // 60} min; check the node "
+                               "(journalctl -u pmm-agent).")
+    rc = int(result.get("rc", "255") or 255)
+    agent.mark_seen(ctx.host.id, ctx.node, int(result.get("agent", "1") or 1))
+    if result.get("reason") == "busy":
+        raise RuntimeError("An update is already running on this node (agent busy).")
+    ctx.log("Upgrade finished: " + ("OK" if rc == 0 else f"FAILED (apt-get exit code {rc})")
+            + (f", {result['upgraded']} package(s) upgraded" if result.get("upgraded") else ""))
+    if rc != 0:
+        ctx.log("Open the node terminal to look at it (apt-get -f install / dpkg --configure -a), "
+                "or check journalctl -u pmm-agent on the node.")
+    ctx.flush()
+    _repoll(ctx)
+    reboot = False
+    try:
+        with db_session() as db:
+            h = db.get(ProxmoxHost, ctx.host.id)
+            s = json.loads(h.last_summary_json) if h and h.last_summary_json else {}
+        n = next((x for x in (s.get("nodes") or []) if x.get("node") == ctx.node), {})
+        reboot = bool(n.get("kernel_reboot_pending"))
+    except Exception:  # noqa: BLE001
+        pass
+    if rc == 0 and reboot:
+        ctx.log(f"A newer kernel is installed than the one running: reboot {ctx.node} to use it (Reboot node).")
+    return {"exit_code": rc, "request_id": rid, "upgraded": result.get("upgraded", ""), "reboot_required": reboot,
+            "warning": bool(rc == 0 and reboot)}
+
+
 API_KINDS = {
+    "agent_upgrade": _agent_upgrade,
     "refresh_packages": _api_refresh_packages,
     "api_reboot": _api_reboot,
     "switch_repos": _api_switch_repos,

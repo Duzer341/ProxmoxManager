@@ -64,8 +64,8 @@ def _describe(exc: Exception) -> str:
     low = msg.lower()
     if isinstance(exc, AuthenticationError) or "couldn't authenticate" in low:
         return "Authentication failed (check user, token/password and permissions)."
-    if "no certificate is pinned" in low:
-        return "The dashboard refused to contact the host without a pinned TLS certificate. Run Test connection on Edit host."
+    if "no certificate is pinned" in low or tlspin.PENDING_MARK in low:
+        return tlspin.PENDING_MESSAGE
     if "fingerprints did not match" in low or tlspin.MISMATCH_MARK in low:
         return ("The host's TLS certificate changed since it was pinned, so nothing was sent to it. If the "
                 "certificate was replaced on purpose, accept the new one on Edit host (Check certificate); "
@@ -74,6 +74,9 @@ def _describe(exc: Exception) -> str:
         return "TLS certificate verification failed (disable 'Verify SSL' for self-signed certs)."
     if "max retries" in low or "connection refused" in low or "name or service not known" in low:
         return "Could not connect (host unreachable, wrong port, or DNS failure)."
+    if "connection aborted" in low or "remotedisconnected" in low or "connection reset" in low:
+        # something answered on the port but closed the connection (service down, firewall or IPS in between)
+        return "Connection dropped by the host (it closed the connection without answering: PVE service down or a firewall in between)."
     if "timed out" in low or "timeout" in low:
         return "Connection timed out."
     if "401" in msg or "authentication" in low:
@@ -123,9 +126,17 @@ def _fetch_nodes(api: ProxmoxAPI, host: ProxmoxHost) -> list[dict[str, Any]]:
         raise PveError(_describe(exc)) from exc
     if not nodes:
         raise PveError(_no_permission_message(host))
-    return nodes
+    # node names come from the host and end up in API paths
+    # (proxmoxer doesn't encode path segments), so only proper node names are used, like user-supplied ones
+    good = [n for n in nodes if isinstance(n.get("node"), str) and NODE_NAME_RE.fullmatch(n["node"])]
+    if len(good) != len(nodes):
+        log.warning("%s reported %d node(s) with invalid names; ignored", host.name, len(nodes) - len(good))
+    if not good:
+        raise PveError("The host reported no valid node names.")
+    return good
 
 
+NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
 KERNEL_PKG_RE = re.compile(r"^(?:proxmox|pve)-kernel-(\d+\.\d+\.\d+-\d+-pve)(?:-signed)?$")
 KERNEL_META_RE = re.compile(r"^(?:proxmox|pve)-kernel(?:-\d+\.\d+)?$")
 
@@ -659,6 +670,19 @@ def node_network(host: ProxmoxHost, node: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001  (DNS is extra; the interface list still shows)
         dns_error = _describe(exc)
     return {"interfaces": ifaces, "dns": dns, "dns_error": dns_error}
+
+
+def package_changelog(host: ProxmoxHost, node: str, name: str, version: str) -> str:
+    """the Debian changelog of a package version, as the node downloads it from its repository
+    (GET /nodes/{node}/apt/changelog; the token needs Sys.Modify, like the pending-update list)."""
+    api = connect(host)
+    try:
+        text = api.nodes(node).apt.changelog.get(name=name, version=version)
+    except ResourceException as exc:
+        raise PveError(_describe(exc)) from exc
+    except Exception as exc:
+        raise PveError(_describe(exc)) from exc
+    return text if isinstance(text, str) else ""
 
 
 def list_backup_storages(host: ProxmoxHost, node: str) -> list[dict[str, Any]]:

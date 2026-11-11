@@ -23,6 +23,19 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
+_dummy_hash: list[str] = []
+
+
+def burn_password_check(password: str) -> None:
+    """the same bcrypt work for an unknown / disabled / Microsoft account
+    as for a real one, so response time doesn't reveal which usernames exist."""
+    if not _dummy_hash:
+        import secrets as _secrets
+
+        _dummy_hash.append(hash_password(_secrets.token_urlsafe(24)))
+    verify_password(password, _dummy_hash[0])
+
+
 def verify_password(password: str, password_hash: str) -> bool:
     try:
         return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
@@ -189,5 +202,7 @@ def require_same_origin(request: Request) -> None:
     from urllib.parse import urlparse
 
     parsed = urlparse(origin)
-    if parsed.netloc and parsed.netloc != host:
+    # "Origin: null" / an empty or other host is refused, and so is a different scheme
+    # (the scheme comes from nginx's X-Forwarded-Proto via uvicorn --proxy-headers)
+    if not parsed.netloc or parsed.netloc != host or (parsed.scheme or "").lower() != request.url.scheme.lower():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-origin request blocked")

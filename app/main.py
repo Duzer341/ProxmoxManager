@@ -172,7 +172,7 @@ async def _stepup_required(request: Request, exc: stepup.StepUpRequired):
 @app.exception_handler(StarletteHTTPException)
 async def _http_error(request: Request, exc: StarletteHTTPException):
     if request.url.path.startswith("/api/"):
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
     if exc.status_code in (403, 404):
         return render(
             request,

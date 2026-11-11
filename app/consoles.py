@@ -24,6 +24,7 @@ console page polls /status for the countdowns and can send a keep-alive ("Stay c
 """
 
 import asyncio
+import re
 import logging
 import secrets
 import ssl
@@ -95,6 +96,7 @@ class Session:
     deadline: float = 0.0          # monotonic hard cap (connect + PM_CONSOLE_MAX_SECONDS)
     end_reason: str = ""
     kick: str = ""                 # set to end the session from outside (e.g. the user was disabled)
+    auth: str = "ticket"           # "ticket" (root@pam sign-in) or "token" (VM console on the host's API token)
 
 
 _lock = threading.Lock()
@@ -149,7 +151,8 @@ def idle_seconds() -> float:
 
 
 def create(user, host: ProxmoxHost, node: str, vmid: int | None, kind: str, name: str, client_ip: str,
-           ticket: str, csrf: str, browser_sid: str = "", stepup_method: str = "", signin_at: float = 0.0) -> Session:
+           ticket: str, csrf: str, browser_sid: str = "", stepup_method: str = "", signin_at: float = 0.0,
+           auth: str = "ticket") -> Session:
     _cleanup()
     label = label_for(kind, node, vmid, name)
     with db_session() as db:
@@ -161,13 +164,13 @@ def create(user, host: ProxmoxHost, node: str, vmid: int | None, kind: str, name
     # A reused ticket keeps the time it was issued (Proxmox tickets live 2 hours), so reuse can't
     # stretch it past that.
     with _lock:
-        issued = min((x.ticket_ts for x in _sessions.values() if x.pve_ticket == ticket and x.ticket_ts > 0),
-                     default=time.time())
+        issued = min((x.ticket_ts for x in _sessions.values() if ticket and x.pve_ticket == ticket and x.ticket_ts > 0),
+                     default=time.time() if ticket else 0.0)
     s = Session(id=secrets.token_urlsafe(24), user_id=user.id, username=user.username, host_id=host.id, node=node,
                 vmid=vmid, kind=kind, label=label, client_ip=client_ip or "", pve_ticket=ticket, csrf=csrf,
                 ticket_ts=issued, log_id=log_id, name=name or "", browser_sid=browser_sid or "",
                 stepup_method=stepup_method or "", host_name=host.name, role=user.role, user_key=user.session_key or "",
-                node_label=node_names_of(host).get(node, ""), signin_at=float(signin_at or 0))
+                node_label=node_names_of(host).get(node, ""), signin_at=float(signin_at or 0), auth=auth)
     with _lock:
         _sessions[s.id] = s
     log.info("console requested id=%d user=%s host=%s %s ip=%s", log_id, user.username, host.name, label, client_ip)
@@ -180,10 +183,44 @@ def reuse_ticket(user_id: int, host_id: int) -> tuple[str, str] | None:
     with _lock:
         best = None
         for s in _sessions.values():
-            if s.user_id == user_id and s.host_id == host_id and now - s.ticket_ts < TICKET_REUSE_SECONDS:
+            if s.user_id == user_id and s.host_id == host_id and s.pve_ticket and now - s.ticket_ts < TICKET_REUSE_SECONDS:
                 if best is None or s.ticket_ts > best.ticket_ts:
                     best = s
         return (best.pve_ticket, best.csrf) if best else None
+
+
+# --------------------------------------------------------------------------- #
+# VM consoles on the host's API token (hosts switched to a pmm@pve token)
+# --------------------------------------------------------------------------- #
+
+TOKEN_BLOCK_SECONDS = 3600
+_token_blocked: dict[int, tuple[float, str]] = {}
+
+
+def token_vm_consoles(host: ProxmoxHost) -> bool:
+    """VM consoles can use the host's API token: token auth, and the token wasn't refused for a
+    console in the last hour (then the root password is asked for, as before)."""
+    if host.auth_type != "token" or not host.secret_enc:
+        return False
+    with _lock:
+        hit = _token_blocked.get(host.id)
+    return not (hit and time.time() - hit[0] < TOKEN_BLOCK_SECONDS)
+
+
+def block_token(host_id: int, why: str) -> None:
+    with _lock:
+        _token_blocked[host_id] = (time.time(), why)
+
+
+def unblock_token(host_id: int) -> None:
+    with _lock:
+        _token_blocked.pop(host_id, None)
+
+
+def _token_header(host: ProxmoxHost) -> str:
+    from . import crypto
+
+    return f"PVEAPIToken={host.pve_user}!{host.token_name}={crypto.decrypt(host.secret_enc)}"
 
 
 def drop_ticket(ticket: str) -> None:
@@ -267,14 +304,27 @@ def start(s: Session, host: ProxmoxHost) -> dict:
         tlspin.prepare(host)   # certificate pin
     except (OSError, tlspin.PinError) as exc:
         raise ConsoleError(f"Could not reach {host.name} securely: {exc}") from exc
+    if s.auth == "token":
+        auth_kw = {"headers": {"Authorization": _token_header(host)}}
+    else:
+        auth_kw = {"cookies": {"PVEAuthCookie": s.pve_ticket}, "headers": {"CSRFPreventionToken": s.csrf}}
     try:
         r = requests.post(f"https://{_host_base(host)}{path}", data=params, timeout=HTTP_TIMEOUT,
-                          verify=host.verify_ssl, cookies={"PVEAuthCookie": s.pve_ticket},
-                          headers={"CSRFPreventionToken": s.csrf})
+                          verify=host.verify_ssl, **auth_kw)
     except requests.RequestException as exc:
         if "fingerprints did not match" in str(exc).lower():
             raise ConsoleError(tlspin.explain(exc, host) or str(exc)) from exc
         raise ConsoleError(f"Could not reach {host.name} ({exc.__class__.__name__}).") from exc
+    if s.auth == "token" and r.status_code in (401, 403):
+        msg = (r.reason or "").strip()
+        try:
+            msg = (r.json() or {}).get("message", msg) or msg
+        except ValueError:
+            pass
+        block_token(s.host_id, f"HTTP {r.status_code} {str(msg).strip()[:160]}")
+        raise ConsoleError(f"Proxmox refused the API token for this console (HTTP {r.status_code} {str(msg).strip()[:160]}). "
+                           "Close this tab and open the console again: the dashboard will ask for the root password "
+                           "for this host's consoles for the next hour.")
     if r.status_code == 401:
         raise TicketRejected("The root@pam session on the host expired. Close this tab and open the console again.")
     if r.status_code != 200:
@@ -287,7 +337,12 @@ def start(s: Session, host: ProxmoxHost) -> dict:
     data = (r.json() or {}).get("data") or {}
     if not data.get("port") or not data.get("ticket"):
         raise ConsoleError("Proxmox didn't return a console port.")
-    s.port, s.vncticket, s.pve_user = str(data["port"]), str(data["ticket"]), str(data.get("user") or "root@pam")
+    user = str(data.get("user") or "root@pam")
+    if not re.fullmatch(r"[^\s:@]{1,64}@[A-Za-z0-9.-]{1,64}(![A-Za-z0-9._-]{1,64})?", user):
+        user = "root@pam"   # a host-reported value goes into the termproxy handshake line
+    s.port, s.vncticket, s.pve_user = str(data["port"]), str(data["ticket"]), user
+    if not re.fullmatch(r"\d{1,5}", s.port) or any(c in s.vncticket for c in "\r\n"):
+        raise ConsoleError("Proxmox returned an invalid console port or ticket.")
     s.started = time.time()
     return {"password": s.vncticket} if s.kind == "vm" else {}
 
@@ -433,7 +488,9 @@ async def relay(ws: WebSocket, s: Session, host: ProxmoxHost) -> None:
     try:
         # the root@pam cookie only goes to the pinned certificate (checked before the upgrade request)
         expected = "" if host.verify_ssl else await asyncio.to_thread(tlspin.prepare, host)
-        async with connect(url, additional_headers={"Cookie": "PVEAuthCookie=" + quote(s.pve_ticket, safe="")},
+        upstream_auth = ({"Authorization": await asyncio.to_thread(_token_header, host)} if s.auth == "token"
+                         else {"Cookie": "PVEAuthCookie=" + quote(s.pve_ticket, safe="")})
+        async with connect(url, additional_headers=upstream_auth,
                            subprotocols=["binary"], ssl=_ssl_context(host), max_size=None, ping_interval=None,
                            create_connection=None if host.verify_ssl else tlspin.pinned_connection(expected),
                            open_timeout=15, close_timeout=5, proxy=None) as upstream:  # always direct to the host
@@ -519,7 +576,11 @@ async def relay(ws: WebSocket, s: Session, host: ProxmoxHost) -> None:
     except InvalidStatus as exc:
         code = exc.response.status_code
         reason = f"host refused the console websocket (HTTP {code})"
-        if code == 401:
+        if s.auth == "token" and code in (401, 403):
+            block_token(s.host_id, f"websocket HTTP {code}")
+            reason += (": the API token was refused for the console websocket. Close this tab and open the console "
+                       "again; the dashboard will ask for the root password")
+        elif code == 401:
             drop_ticket(s.pve_ticket)
             reason += ": the root@pam sign-in was rejected. Close this tab and open the console again"
         await _close_with(ws, 4002, reason)

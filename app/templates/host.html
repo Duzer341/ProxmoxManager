@@ -5,10 +5,11 @@
   <span class="dot" id="status-dot" style="margin-top:2px"></span>
   <h1>{{ host.name }}</h1>
   <span class="sub">{% if host.client %}{{ host.client }} · {% endif %}<span class="mono">{{ host.host }}:{{ host.port }}</span></span>
+  <span class="tags" id="host-tags"></span>
   <div class="actions">
     <span class="muted" id="polled"></span>
     <button class="btn" id="refresh">Refresh now</button>
-    {% if current_user.is_admin %}<a class="btn" href="/manage/hosts?edit={{ host.id }}">Edit</a><a class="btn danger" href="/manage/hosts?delete={{ host.id }}">Delete</a>{% endif %}
+    {% if current_user.is_admin %}<button class="btn" id="convert-open" style="display:none" title="Create a pmm@pve user with the PMM role and an API token on this host, and use that instead of the root@pam password">Switch to API token</button><a class="btn" href="/manage/hosts?edit={{ host.id }}">Edit</a><a class="btn danger" href="/manage/hosts?delete={{ host.id }}">Delete</a>{% endif %}
     {% if show_pve_links %}<a class="btn primary" href="{{ host.ui_url }}" target="_blank" rel="noopener">Open PVE web UI ↗</a>{% endif %}
   </div>
 </div>
@@ -33,7 +34,7 @@
     {% if current_user.is_admin %}<span class="muted" id="ssh-hint" style="font-weight:400; font-size:12.5px"></span>{% endif %}
   </h2>
   <div id="nodes"><div class="empty">Loading…</div></div>
-  {% if current_user.can("console") %}<div class="muted" id="shell-saved" style="display:none; font-size:12.5px; margin-top:8px">Root password saved for the terminal, Upgrade shell and guest consoles on this host. <button class="btn sm link" id="shell-forget">Forget it</button></div>{% endif %}
+  {% if current_user.can("console") %}<div class="muted" id="shell-saved" style="display:none; font-size:12.5px; margin-top:8px">Root password saved for the terminal and guest consoles on this host. <button class="btn sm link" id="shell-forget">Forget it</button></div>{% endif %}
 </div>
 
 <div class="section" id="jobs-section" style="display:none">
@@ -57,7 +58,7 @@
   </div>
 </div>
 
-<!-- Terminal / Upgrade shell / guest console sign-in -->
+<!-- Terminal / guest console sign-in -->
 <div class="modal-bg" id="shell-modal">
   <div class="modal">
     <h2>Sign in to Proxmox</h2>
@@ -74,11 +75,76 @@
   </div>
 </div>
 
+{% if current_user.is_admin %}
+<!-- switch a root@pam password host to a pmm@pve API token -->
+<div class="modal-bg" id="convert-modal">
+  <div class="modal" style="max-width:640px">
+    <h2>Switch to an API token</h2>
+    <div id="convert-intro">
+      <p style="margin-top:0">The dashboard signs in to <b id="convert-host"></b> as root@pam once more and sets up its own account:</p>
+      <ol class="convert-list">
+        <li>Role <b>PMM</b> with only what the dashboard uses: <span class="muted" id="convert-privs"></span></li>
+        <li>User <b>pmm@pve</b> with a long random password that is set and thrown away. Nobody can sign in to the web UI with it; only its token works.</li>
+        <li><b>PMM</b> on <span class="mono">/</span> for pmm@pve (all nodes, guests and storage).</li>
+        <li>An API token for pmm@pve, stored encrypted in the dashboard only.</li>
+        <li>A check that the token sees the same nodes and guests as root@pam. Only then the host switches to the token
+          and the stored root@pam credential is removed. If anything fails, what was created is removed again.</li>
+      </ol>
+      <div id="convert-token-opts" style="display:none" class="confirm-box">
+        <div>This host signs in with the root@pam API token <b class="mono" id="convert-old-token"></b>, which has full root
+          access. The switch uses it, then removes it from the host.</div>
+        <label class="inline" style="display:flex; gap:6px; align-items:center; margin:6px 0; color:var(--text)">
+          <input type="checkbox" id="convert-remove-old" checked style="width:auto"> Remove the old root@pam token from the host afterwards</label>
+        <div class="field" style="margin:0"><label for="convert-pw">root@pam password (optional, not stored): only needed if Proxmox refuses the switch with the token</label>
+          <input type="password" id="convert-pw" autocomplete="off"></div>
+      </div>
+      <p class="muted" style="font-size:12.5px">Afterwards: VM consoles open on the token. The node terminal and
+        container consoles ask for the root password when you open them (it isn't stored). Updates: Update node (update agent), or SSH if
+        it's set up for this host.</p>
+    </div>
+    <div id="convert-result" style="display:none"></div>
+    <p class="bad-text" id="convert-err" style="display:none; font-size:13px"></p>
+    <div class="foot">
+      <button class="btn" data-close="convert-modal" id="convert-cancel">Cancel</button>
+      <button class="btn primary" id="convert-go">Switch to API token</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if current_user.can("node.actions") %}
+<!-- install the update agent on a node -->
+<div class="modal-bg" id="agent-modal">
+  <div class="modal" style="max-width:760px">
+    <h2>Set up updates on <span id="agent-node"></span></h2>
+    <p style="margin-top:0">A small agent on the node installs updates when the dashboard asks, so updating takes one click and no
+      root password. It opens no port and connects nowhere: the dashboard leaves a signed request in the node's notes over the
+      Proxmox API and reads the agent's output from the node's log. Only requests signed by this dashboard
+      (key <span class="mono" id="agent-key"></span>) are accepted, and the only thing it can do is install pending updates.</p>
+    <ol class="convert-list">
+      <li><b>Open terminal</b> on this node (asks for the root password one last time).</li>
+      <li><b>Copy</b> the block below, paste it into the terminal (Ctrl+Shift+V) and press Enter.</li>
+      <li><b>Check agent</b>. On a cluster, repeat for each node.</li>
+    </ol>
+    <textarea id="agent-script" readonly rows="12" spellcheck="false" style="font-family:var(--mono); font-size:11.5px; white-space:pre"></textarea>
+    <details style="margin-top:8px; font-size:12.5px"><summary>Remove the agent from a node</summary>
+      <pre class="mono" id="agent-uninstall" style="font-size:12px; margin:6px 0 0"></pre></details>
+    <p id="agent-status" style="font-size:13px"></p>
+    <div class="foot">
+      <button class="btn" data-close="agent-modal">Close</button>
+      <button class="btn" id="agent-copy">Copy</button>
+      <button class="btn" id="agent-terminal">Open terminal ↗</button>
+      <button class="btn primary" id="agent-check">Check agent</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <!-- Console re-auth: a fresh check before any console -->
 <div class="modal-bg" id="stepup-modal">
   <div class="modal">
     <h2>Verify it's you</h2>
-    <p style="margin-top:0">Consoles need a fresh check, even when you're signed in. Afterwards you can open consoles from this
+    <p style="margin-top:0" id="stepup-why">Consoles need a fresh check, even when you're signed in. Afterwards you can open consoles from this
       browser for <b id="stepup-mins">15</b> minutes. Using them doesn't extend that.</p>
     <div id="stepup-totp">
       <div class="field"><label for="stepup-code">Current code from your authenticator app</label>
@@ -207,6 +273,7 @@
   <h2>Network <span class="count" id="network-count"></span>
     <div class="actions"><button class="btn sm" id="network-refresh" title="Read the interfaces and DNS of every node again">Refresh</button></div>
   </h2>
+  <div id="network-stale" class="net-stale" style="display:none"></div>
   <div id="network-facts" class="net-facts-list"></div>
   <div class="card table-wrap" style="padding:0"><table id="network" class="net-table"><thead></thead><tbody></tbody></table></div>
 </div>
@@ -238,7 +305,7 @@
   let data = null;
   const diskCache = {};   // node -> disks[]
   const openNodes = {};   // node -> bool
-  const netCache = {};    // node -> {net} | {error} | {loading} (Network section)
+  const netCache = {};    // node -> {net} | {error} | {loading} | {none}   (Network section; net.stale = saved copy)
 
   function tile(label, value, sub, cls) {
     return '<div class="tile"><div class="label">' + label + '</div><div class="value ' + (cls || "") + '">' + value + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : "") + '</div>';
@@ -246,17 +313,20 @@
 
   function renderTiles(s, avg) {
     avg = avg || {};
+    const LASTK = s && s.unreachable ? " · last known" : "";
     const t = document.getElementById("tiles");
     if (!s) { t.innerHTML = ""; return; }
     const mixed = s.pve_versions && s.pve_versions.length > 1;
     t.innerHTML =
       tile("Proxmox VE", PM.esc(s.version), mixed ? '<span class="warn-text">mixed: ' + PM.esc(s.pve_versions.join(", ")) + '</span>' : "release " + PM.esc(s.release) + (s.repoid ? " · " + PM.esc(s.repoid) : "")) +
       tile(s.is_cluster ? "Cluster" : "Mode", s.is_cluster ? PM.esc(s.cluster_name) : "Standalone", s.is_cluster ? (s.quorate ? '<span class="ok-text">quorate</span>' : '<span class="bad-text">no quorum</span>') + " · " + s.nodes_online + "/" + s.node_count + " nodes online" : "single node", s.is_cluster && !s.quorate ? "bad-text" : "") +
-      tile("Guests", '<span class="ok-text">' + s.guests_running + '</span><small>running</small>', s.guests_stopped + " stopped" +
-        (s.guests_unknown ? ' · <span class="warn-text" title="On nodes that are offline">' + s.guests_unknown + " unknown</span>" : "")) +
-      tile("CPU", PM.pct(s.cpu_pct), s.cores + " cores" + (avg.cpu_pct != null ? " · avg " + PM.pct(avg.cpu_pct) : ""), PM.level(s.cpu_pct) + "-text") +
-      tile("RAM", PM.pct(s.mem_pct), PM.bytes(s.mem_used) + " of " + PM.bytes(s.mem_total) + (avg.mem_pct != null ? " · avg " + PM.pct(avg.mem_pct) : ""), PM.level(s.mem_pct, 85, 95) + "-text") +
-      tile("Storage", PM.pct(s.disk_pct), PM.bytes(s.disk_used) + " of " + PM.bytes(s.disk_total) + (avg.disk_pct != null ? " · avg " + PM.pct(avg.disk_pct) : ""), PM.level(s.disk_pct, 80, 90) + "-text");
+      (s.unreachable
+        ? tile("Guests", '<span class="warn-text">' + s.guests_unknown + '</span><small>unknown</small>', "host not reachable")
+        : tile("Guests", '<span class="ok-text">' + s.guests_running + '</span><small>running</small>', s.guests_stopped + " stopped" +
+          (s.guests_unknown ? ' · <span class="warn-text" title="On nodes that are offline">' + s.guests_unknown + " unknown</span>" : ""))) +
+      tile("CPU", PM.pct(s.cpu_pct), s.cores + " cores" + LASTK + (avg.cpu_pct != null ? " · avg " + PM.pct(avg.cpu_pct) : ""), PM.level(s.cpu_pct) + "-text") +
+      tile("RAM", PM.pct(s.mem_pct), PM.bytes(s.mem_used) + " of " + PM.bytes(s.mem_total) + LASTK + (avg.mem_pct != null ? " · avg " + PM.pct(avg.mem_pct) : ""), PM.level(s.mem_pct, 85, 95) + "-text") +
+      tile("Storage", PM.pct(s.disk_pct), PM.bytes(s.disk_used) + " of " + PM.bytes(s.disk_total) + LASTK + (avg.disk_pct != null ? " · avg " + PM.pct(avg.disk_pct) : ""), PM.level(s.disk_pct, 80, 90) + "-text");
   }
 
   function renderSparks(history, hours) {
@@ -385,7 +455,8 @@
       if (i.vlan_id) vlan = 'ID <b>' + PM.esc(i.vlan_id) + '</b>';
       else if (i.vlan_aware) vlan = '<span title="VLAN-aware bridge: guests can use VLAN tags">aware</span>' + (i.vlan_ids ? ' <span class="muted mono">' + PM.esc(i.vlan_ids) + '</span>' : "");
       const state = i.active ? '<span class="badge ok">active</span>' : '<span class="badge' + (i.type === "eth" ? "" : " warn") + '" title="' + (i.type === "eth" ? "Not configured or no link" : "Configured but not active") + '">inactive</span>';
-      return '<tr data-net-node="' + PM.esc(node) + '"' + (isMgmt ? ' class="net-mgmt"' : "") + '>' + nodeCell(node) +
+      const cls = [isMgmt ? "net-mgmt" : "", net.stale ? "stale" : ""].filter(Boolean).join(" ");
+      return '<tr data-net-node="' + PM.esc(node) + '"' + (cls ? ' class="' + cls + '"' : "") + (net.stale ? ' title="Last known, as of ' + PM.esc(PM.when(net.as_of)) + '"' : "") + '>' + nodeCell(node) +
         '<td class="mono nowrap">' + PM.esc(i.iface) + (isMgmt ? ' <span class="badge accent" title="The address Proxmox resolves this node\'s name to (cluster / management traffic)">management</span>' : "") + '</td>' +
         '<td>' + type + '</td>' +
         '<td class="mono nowrap">' + netAddr(i.cidr, i.method) + '</td>' +
@@ -410,33 +481,54 @@
     thead.innerHTML = '<tr><th>Node</th><th>Interface</th><th>Type</th><th>IPv4</th><th>Gateway</th>' + (has6 ? '<th>IPv6</th>' : "") +
       '<th>Ports / slaves</th><th>VLAN</th><th>State</th><th>Comment</th></tr>';
     let rows = "", facts = "", total = 0;
+    const stale = [];
     nodes.forEach(function (n) {
       const c = netCache[n.node];
-      if (!n.online) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">Node offline</td></tr>'; return; }
+      const offMsg = n.status === "unreachable" ? "Host not reachable" : "Node offline";
+      if (!n.online && (!c || !c.net)) {
+        rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">' + offMsg + (c && c.none ? ". No network information was saved for it before." : "") + '</td></tr>';
+        return;
+      }
       if (!c || c.loading) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">Loading network…</td></tr>'; return; }
       if (c.error) { rows += '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="err">' + PM.esc(c.error) + '</td></tr>'; return; }
+      if (c.net.stale) stale.push({ node: n.node, as_of: c.net.as_of, why: n.online ? (c.net.live_error || "the node did not answer") : offMsg.toLowerCase() });
       facts += netFacts(n.node, c.net);
       const ifs = c.net.interfaces || [];
       total += ifs.length;
       rows += ifs.length ? netRows(n.node, c.net, has6) : '<tr>' + nodeCell(n.node) + '<td colspan="' + (cols - 1) + '" class="muted">No interfaces reported.</td></tr>';
     });
     tb.innerHTML = rows || '<tr><td colspan="' + cols + '" class="empty">No nodes.</td></tr>';
+    const staleEl = document.getElementById("network-stale");
+    if (stale.length) {
+      staleEl.style.display = "";
+      staleEl.innerHTML = '<b>Last known network information</b> ' + stale.map(function (x) {
+        return '<span class="mono">' + PM.esc(x.node) + '</span> as of ' + PM.esc(PM.when(x.as_of)) + ' (' + PM.esc(x.why) + ')';
+      }).join("; ") + '. This may have changed since then: addresses or VLANs edited on the node, a DHCP lease renewed, ' +
+        'bridges or bonds reconfigured, or cabling and switch ports moved. Check on the host before relying on it.';
+    } else { staleEl.style.display = "none"; staleEl.innerHTML = ""; }
     factsEl.innerHTML = facts;
     countEl.textContent = total ? total + " interface" + (total === 1 ? "" : "s") + (nodes.length > 1 ? " on " + nodes.length + " nodes" : "") : "";
   }
   let netBusy = false;
   async function loadNetwork(force) {
     if (!data || !data.summary || (netBusy && !force)) return;
-    const want = (data.summary.nodes || []).filter(function (n) { return n.online && (force || !netCache[n.node]); }).map(function (n) { return n.node; });
+    const nodes = data.summary.nodes || [];
+    // a node that comes back online is read live again; an unreachable / offline one gets the saved copy once
+    const want = nodes.filter(function (n) {
+      const c = netCache[n.node];
+      if (n.online) return force || !c || (c.net && c.net.stale && !c.net.live_error) || c.none;
+      return force || !c || c.error || (c.net && !c.net.stale);
+    });
     if (!want.length) return;
     netBusy = true;
-    want.forEach(function (node) { netCache[node] = { loading: true }; });
+    want.forEach(function (n) { if (n.online || !netCache[n.node]) netCache[n.node] = { loading: true }; });
     renderNetwork(data.summary);
-    await Promise.all(want.map(async function (node) {
+    await Promise.all(want.map(async function (n) {
+      const url = "/api/hosts/" + HOST_ID + "/nodes/" + encodeURIComponent(n.node) + "/network" + (n.online ? "" : "?cached=1");
       try {
-        netCache[node] = { net: await PM.api("GET", "/api/hosts/" + HOST_ID + "/nodes/" + encodeURIComponent(node) + "/network") };
+        netCache[n.node] = { net: await PM.api("GET", url) };
       } catch (e) {
-        netCache[node] = { error: e.message };
+        netCache[n.node] = n.online ? { error: e.message } : { none: true };
       }
       renderNetwork(data.summary);
     }));
@@ -450,19 +542,28 @@
   const CAN_CONSOLE = can("console"), CAN_NODE = can("node.actions");
   const CAN_GUEST_MORE = ["guest.details", "guest.snapshot", "guest.backup", "guest.disk", "guest.onboot"].some(can);
 
+  document.addEventListener("click", function (e) {
+    const b = e.target.closest("[data-updnotes]");
+    if (!b || !data || !data.summary) return;
+    const node = b.getAttribute("data-updnotes");
+    const n = (data.summary.nodes || []).find(function (x) { return x.node === node; });
+    if (n) PM.updateNotes(HOST_ID, data.name, [{ node: n.node, label: nodeLabel(n.node), updates_list: n.updates_list }]);
+  });
+
   function updatesBadge(n) {
     if (n.repo_warning) {
       const label = n.repo_warning === "enterprise_no_subscription" ? "enterprise repo, no subscription" : "no Proxmox repo";
       return '<span class="badge bad" title="' + PM.esc(n.repo_warning_text + " Check updates (SSH) shows ready-to-paste fix commands.") + '">⚠ ' + label + '</span>' +
-        (n.updates ? '<span class="badge warn" title="Only updates from reachable repositories">' + n.updates + ' other update' + (n.updates === 1 ? "" : "s") + '</span>' : "");
+        (n.updates ? '<button type="button" class="badge warn" data-updnotes="' + PM.esc(n.node) + '" title="Only updates from reachable repositories. Click for what they change.">' + n.updates + ' other update' + (n.updates === 1 ? "" : "s") + ' ›</button>' : "");
     }
     if (n.updates == null) {
-      const why = n.updates_error === "permission" ? "Pending-update count needs Sys.Modify on the API token (PVEAuditor is not enough). Use 'Refresh package list' after granting it, or install via Upgrade shell." : (n.updates_error || "unknown");
+      const why = n.updates_error === "permission" ? "Pending-update count needs Sys.Modify on the API token (PVEAuditor is not enough). Use 'Refresh package list' after granting it, or install with Update node." : (n.updates_error || "unknown");
       return '<span class="badge" title="' + PM.esc(why) + '">updates: n/a</span>';
     }
     if (n.updates === 0) return '<span class="badge ok" title="No pending apt updates (per the package lists PVE refreshes daily)">up to date</span>';
-    const list = (n.updates_list || []).map(function (u) { return u.package + " " + (u.old ? u.old + " → " : "") + u.new; }).join("\n");
-    return '<span class="badge warn" title="' + PM.esc(list) + '">' + n.updates + ' update' + (n.updates === 1 ? "" : "s") + (n.updates_kernel ? " incl. kernel" : "") + '</span>';
+    // click for cliff notes from the changelogs and a CVE lookup
+    return '<button type="button" class="badge warn" data-updnotes="' + PM.esc(n.node) + '" title="What these updates change, and which CVEs they fix">' +
+      n.updates + ' update' + (n.updates === 1 ? "" : "s") + (n.updates_kernel ? " incl. kernel" : "") + ' ›</button>';
   }
 
   // a node whose clock is off breaks consoles in a cluster (Proxmox accepts root@pam tickets from
@@ -492,7 +593,7 @@
   function nodeActions(n) {
     if (!n.online) return "";
     const node = PM.esc(n.node);
-    // Upgrade shell turns yellow while the node has pending updates.
+    // Update node turns yellow while the node has pending updates.
     const pending = n.updates > 0;
     const upCls = "btn sm" + (pending ? " warn" : "");
     const pendingTip = pending ? n.updates + " update" + (n.updates === 1 ? "" : "s") + " pending" + (n.updates_kernel ? ", including a kernel" : "") + ". " : "";
@@ -503,7 +604,7 @@
     const busyId = data && data.active_jobs && data.active_jobs[n.node];
     const dis = busyId ? ' disabled title="A job is already running on this node"' : "";
     let html = (CAN_CONSOLE ? '<button class="btn sm primary" data-terminal="' + node + '" title="Opens a root shell on the node in a new tab, relayed through the dashboard (same as Node → Shell). Asks you to verify it\'s you first.">Open terminal ↗</button>' : "") + disks;
-    if (!CAN_NODE) return html + (CAN_CONSOLE ? upgradeBtn(n, node, upCls, pendingTip) : "");
+    if (!CAN_NODE) return html;
     if (n.repo_warning === "enterprise_no_subscription")
       html += '<button class="btn sm primary" data-switch-repos="' + node + '"' + dis + ' title="Disable the enterprise repositories and add No-Subscription (same as Node > Updates > Repositories in Proxmox)">Switch to no-subscription</button>';
     html += '<button class="btn sm" data-refresh-pkgs="' + node + '"' + dis + ' title="Run apt update through the Proxmox API so the pending-update list is current (no SSH)">Refresh package list</button>';
@@ -511,14 +612,17 @@
       html += '<button class="btn sm" data-check="' + node + '"' + dis + '>Check updates (SSH)</button>' +
         '<button class="btn sm primary" data-upgrade="' + node + '"' + dis + '>Update node (SSH)</button>';
     }
-    if (CAN_CONSOLE) html += upgradeBtn(n, node, upCls, pendingTip);
+    html += agentBtn(n, node, upCls, pendingTip, dis);
     html += '<button class="btn sm danger" data-reboot="' + node + '" data-via="' + (ssh ? "ssh" : "api") + '"' + dis + '>Reboot node</button>';
     if (busyId) html += '<button class="btn sm" data-job="' + busyId + '"><span class="spin"></span> View job</button>';
     return html;
   }
 
-  function upgradeBtn(n, node, upCls, pendingTip) {
-    return '<button class="' + upCls + '" data-shell="' + node + '" title="' + PM.esc(pendingTip + "Install updates: opens the pveupgrade terminal in a new tab, relayed through the dashboard (same as Node → Updates → Upgrade)") + '">Upgrade shell ↗</button>';
+  // updates through the update agent (replaces the Upgrade shell button)
+  function agentBtn(n, node, upCls, pendingTip, dis) {
+    const ag = data && data.agents && data.agents[n.node];
+    if (!ag) return '<button class="btn sm" data-agent-setup="' + node + '" title="Install the small update agent on this node once; then updates are one click, with no root password">Set up updates</button>';
+    return '<button class="' + upCls + '" data-agent-upgrade="' + node + '"' + dis + ' title="' + PM.esc(pendingTip + "Install the pending updates through the update agent (apt-get dist-upgrade, keeps your config files). Reboot stays a separate step.") + '">Update node</button>';
   }
 
   function renderNodes(s) {
@@ -536,17 +640,17 @@
         '<div class="node-head">' +
           '<span class="dot ' + (n.online ? "ok" : "bad") + '"></span><span class="name">' + PM.esc(n.node) + '</span>' +
           (nodeLabel(n.node) ? '<span class="node-label" title="Friendly name (Edit host)">(' + PM.esc(nodeLabel(n.node)) + ')</span>' : "") +
-          '<span class="badge ' + (n.online ? "" : "bad") + '">' + PM.esc(n.status) + '</span>' +
+          '<span class="badge ' + (n.online ? "" : "bad") + '"' + (n.status === "unreachable" ? ' title="The host is not answering, so this node\'s state is unknown. Last reported: ' + PM.esc(n.last_status || "-") + '. The details shown are from then."' : "") + '>' + PM.esc(n.status) + '</span>' +
           (n.online ? updatesBadge(n) + rebootBadge(n) + clockBadge(n) : "") +
           (n.ip ? '<span class="kv">IP <button type="button" class="ip-copy mono" data-copy-ip="' + PM.esc(n.ip) + '" title="Management IP of this node. Click to copy.">' + PM.esc(n.ip) + '</button></span>' : "") +
           (n.pve_version ? '<span class="kv">' + PM.esc(n.pve_version) + '</span>' : "") +
           (n.kernel ? '<span class="kv">kernel <b>' + PM.esc(n.kernel) + '</b></span>' : "") +
           (n.cpu_model ? '<span class="kv" title="' + PM.esc(n.cpu_model) + '">' + n.cores + ' × ' + PM.esc(n.cpu_model.length > 34 ? n.cpu_model.slice(0, 34) + "…" : n.cpu_model) + '</span>' : '<span class="kv"><b>' + n.cores + '</b> cores</span>') +
-          '<span class="kv">CPU <b>' + PM.pct(n.cpu_pct) + '</b></span>' +
+          (n.online ? '<span class="kv">CPU <b>' + PM.pct(n.cpu_pct) + '</b></span>' : "") +
           '<span class="kv">RAM <b>' + PM.bytes(n.mem_used) + '</b> / ' + PM.bytes(n.mem_total) + ' (' + PM.pct(n.mem_pct) + ')</span>' +
           '<span class="kv">root <b>' + PM.bytes(n.rootfs_used) + '</b> / ' + PM.bytes(n.rootfs_total) + '</span>' +
-          (n.loadavg && n.loadavg.length ? '<span class="kv">load <b>' + n.loadavg.map(PM.esc).join(" ") + '</b></span>' : "") +
-          '<span class="kv">up <b>' + PM.uptime(n.uptime) + '</b></span>' +
+          (n.online && n.loadavg && n.loadavg.length ? '<span class="kv">load <b>' + n.loadavg.map(PM.esc).join(" ") + '</b></span>' : "") +
+          (n.online ? '<span class="kv">up <b>' + PM.uptime(n.uptime) + '</b></span>' : "") +
           '<div class="actions">' + nodeActions(n) + '</div>' +
         '</div>' +
         '<div class="node-body"><div class="disks" id="disks-' + PM.esc(n.node) + '">' + disksTable(n.node, dc && dc.disks, dc && dc.error) + '</div></div>' +
@@ -555,6 +659,7 @@
   }
 
   function guestActions(g) {
+    if (g.unreachable) return '<span class="muted" style="font-size:12px" title="Actions and consoles come back when the host answers again">host not reachable</span>';
     if (g.node_offline) return '<span class="muted" style="font-size:12px" title="Actions and consoles come back when the node is online">node ' + PM.esc(g.node) + ' offline</span>';
     const running = g.status === "running";
     const canConsole = !g.template && (g.type === "qemu" || running);
@@ -630,7 +735,8 @@
         '<td><span class="badge">' + (g.type === "qemu" ? "VM" : "LXC") + '</span></td>' +
         '<td>' + PM.esc(g.node) + '</td>' +
         '<td>' + (g.node_offline
-          ? '<span class="badge warn" title="Node ' + PM.esc(g.node) + ' is offline, so the guest\'s state is unknown.' + (g.last_status ? ' Last reported: ' + PM.esc(g.last_status) + '.' : "") + '">unknown</span>'
+          ? '<span class="badge warn" title="' + (g.unreachable ? "The host is not answering" : "Node " + PM.esc(g.node) + " is offline") + ', so the guest\'s state is unknown.' + (g.last_status ? ' Last reported: ' + PM.esc(g.last_status) + '.' : "") + '">unknown</span>' +
+            (g.last_status ? ' <span class="muted" style="font-size:12px">last ' + PM.esc(g.last_status) + '</span>' : "")
           : '<span class="badge ' + (running ? "ok" : "") + '">' + PM.esc(g.status) + '</span>') + '</td>' +
         '<td class="num">' + (running ? PM.pct(g.cpu_pct) + ' <span class="muted">/ ' + g.cores + 'c</span>' : '<span class="muted">-</span>') + '</td>' +
         '<td class="nowrap">' + (running ? PM.mini(g.mem_pct, 85, 95) + PM.bytes(g.mem_used) + ' <span class="muted">/ ' + PM.bytes(g.mem_total) + '</span>' : '<span class="muted">' + PM.bytes(g.mem_total) + '</span>') + '</td>' +
@@ -647,8 +753,8 @@
     if (!s) { tb.innerHTML = ""; return; }
     document.getElementById("storage-count").textContent = s.storages.length + " (shared storage counted once)";
     tb.innerHTML = s.storages.length ? s.storages.map(function (st) {
-      return '<tr' + (st.node_offline ? ' class="stale" title="Node ' + PM.esc(st.node) + ' is offline: last reported figures"' : "") + '><td>' + PM.esc(st.storage) + '</td><td>' +
-        (st.shared ? '<span class="badge info">shared</span>' : PM.esc(st.node) + (st.node_offline ? ' <span class="badge warn">offline</span>' : "")) + '</td>' +
+      return '<tr' + (st.node_offline ? ' class="stale" title="' + (st.unreachable ? "Host not reachable" : "Node " + PM.esc(st.node) + " is offline") + ': last reported figures"' : "") + '><td>' + PM.esc(st.storage) + '</td><td>' +
+        (st.shared ? '<span class="badge info">shared</span>' : PM.esc(st.node) + (st.node_offline && !st.unreachable ? ' <span class="badge warn">offline</span>' : "")) + '</td>' +
         '<td class="mono">' + PM.esc(st.plugintype) + '</td><td class="muted">' + PM.esc((st.content || "").split(",").join(", ")) + '</td>' +
         '<td class="nowrap">' + PM.mini(st.pct, 80, 90) + PM.pct(st.pct) + '</td>' +
         '<td class="num">' + PM.bytes(st.used) + '</td><td class="num">' + PM.bytes(st.total) + '</td></tr>';
@@ -666,8 +772,20 @@
     const dot = document.getElementById("status-dot");
     dot.className = "dot " + (!data.enabled ? "" : data.last_error ? "bad" : s ? "ok" : "warn");
     const err = document.getElementById("error");
-    if (data.last_error) { err.style.display = "block"; err.textContent = data.last_error; } else { err.style.display = "none"; }
-    document.getElementById("polled").textContent = data.last_ok_at ? "polled " + PM.ago(data.last_ok_at) : (data.enabled ? "not polled yet" : "polling disabled");
+    if (data.last_error) {
+      err.style.display = "block";
+      err.textContent = data.last_error;
+      const since = document.createElement("div");
+      since.className = "err-since";
+      since.id = "last-up";
+      since.textContent = PM.lastUp(data);
+      err.appendChild(since);
+    } else { err.style.display = "none"; }
+    const cv = document.getElementById("convert-open");
+    if (cv) cv.style.display = (data.auth_type === "password" || data.auth_type === "token") && (data.pve_user || "").toLowerCase() === "root@pam" ? "" : "none";
+    const polled = document.getElementById("polled");
+    polled.textContent = PM.pollText(data).replace("never polled", data.enabled ? "not polled yet" : "polling disabled");
+    polled.title = PM.pollTitle(data);
     renderTiles(s, data.average);
     renderSparks(data.history, data.history_hours);
     renderNodes(s);
@@ -677,7 +795,7 @@
     renderJobs(data.jobs || []);
   }
 
-  const KIND_LABEL = { check_updates: "Check updates (SSH)", upgrade: "Update (SSH dist-upgrade)", reboot: "Reboot (SSH)", refresh_packages: "Refresh package list", api_reboot: "Reboot", switch_repos: "Switch to no-subscription", guest_power: "Guest power", guest_snapshot: "Snapshot", guest_backup: "Backup", guest_resize: "Expand disk", guest_onboot: "Start at boot" };
+  const KIND_LABEL = { agent_upgrade: "Update (update agent)", check_updates: "Check updates (SSH)", upgrade: "Update (SSH dist-upgrade)", reboot: "Reboot (SSH)", refresh_packages: "Refresh package list", api_reboot: "Reboot", switch_repos: "Switch to no-subscription", guest_power: "Guest power", guest_snapshot: "Snapshot", guest_backup: "Backup", guest_resize: "Expand disk", guest_onboot: "Start at boot" };
   const POWER_LABEL = { start: "Start", shutdown: "Shut down", reboot: "Restart", stop: "Power off" };
   function jobLabel(j) {
     const o = j.options || {};
@@ -696,6 +814,7 @@
     if (j.status !== "done" && j.status !== "warning") return '<span class="muted">…</span>';
     const repoWarn = r.repo_errors && r.repo_errors.length ? ' · <span class="warn-text">' + (r.enterprise_no_subscription ? "enterprise repo 401 (no subscription)" : r.repo_errors.length + " repo(s) unreachable") + '</span>' : "";
     if (j.kind === "check_updates") return repoWarn.replace(" · ", "") + (repoWarn ? " · " : "") + (r.count ? '<span class="warn-text">' + r.count + ' update(s)' + (r.kernel_in_updates && r.kernel_in_updates.length ? ", incl. kernel" : "") + '</span>' : (repoWarn ? '<span class="muted">nothing from reachable repos</span>' : '<span class="ok-text">up to date</span>')) + (r.reboot_required ? ' · <span class="bad-text">reboot pending</span>' : "");
+    if (j.kind === "agent_upgrade") return (r.upgraded ? r.upgraded + ' upgraded' : '<span class="ok-text">done</span>') + (r.reboot_required ? ' · <span class="bad-text">reboot required</span>' : ' · no reboot needed');
     if (j.kind === "upgrade") return (r.upgraded != null ? r.upgraded + ' upgraded' : '<span class="ok-text">done</span>') + (r.rebooted ? ' · rebooted' : r.reboot_required ? ' · <span class="bad-text">reboot required</span>' : ' · no reboot needed') + repoWarn;
     if (j.kind === "switch_repos") return '<span class="ok-text">' + ((r.disabled || []).length) + ' disabled, ' + ((r.added || []).length) + ' added</span> · ' + (r.count ? '<span class="warn-text">' + r.count + ' update(s) now visible</span>' : 'no updates');
     if (j.kind === "refresh_packages") return repoWarn.replace(" · ", "") + (repoWarn ? " · " : "") + (r.count ? '<span class="warn-text">' + r.count + ' update(s)' + (r.kernel_in_updates && r.kernel_in_updates.length ? ", incl. kernel" : "") + '</span>' : (repoWarn ? '<span class="muted">nothing from reachable repos</span>' : '<span class="ok-text">up to date</span>'));
@@ -724,6 +843,9 @@
     try {
       const hours = document.getElementById("range").value;
       data = await PM.api("GET", "/api/hosts/" + HOST_ID + "?hours=" + hours);
+      document.getElementById("host-tags").innerHTML = (data.tags || []).map(function (t) {
+        return '<a href="/?tag=' + encodeURIComponent(t) + '" title="Dashboard: hosts tagged ' + PM.esc(t) + '">' + PM.tagChip(t, {}) + '</a>';
+      }).join("");
       render();
     } catch (e) { PM.toast("Failed to load: " + e.message, "bad"); return; }
     loadNetwork(false);   // first load, and nodes that came online since
@@ -738,7 +860,7 @@
 
   function openConfirm(kind, node, via) {
     via = via || (data.ssh_enabled ? "ssh" : "api");
-    pendingAction = { kind: kind, node: node, endpoint: kind === "reboot" && via === "api" ? "api-reboot" : kind };
+    pendingAction = { kind: kind, node: node, endpoint: kind === "reboot" && via === "api" ? "api-reboot" : kind === "agent-upgrade" ? "agent/upgrade" : kind };
     const n = (data.summary.nodes || []).find(function (x) { return x.node === node; }) || {};
     const guests = (data.summary.guests || []).filter(function (g) { return g.node === node && g.status === "running"; }).length;
     const title = document.getElementById("confirm-title"), body = document.getElementById("confirm-body");
@@ -752,6 +874,12 @@
         '2. Add <b>No-Subscription</b> (and the matching Ceph no-subscription repo if Ceph enterprise was configured)<br>' +
         '3. Refresh the package lists and show what updates are now available</p>' +
         '<p class="muted">Nothing is installed and nothing restarts. Proxmox recommends the no-subscription repo for non-production use; if this client pays for a subscription, add the key instead (Node → Subscription).</p>';
+    } else if (kind === "agent-upgrade") {
+      title.textContent = "Update node " + node;
+      body.innerHTML = '<p>The update agent on <b>' + PM.esc(node) + '</b> runs <code>apt-get update</code> and <code>apt-get dist-upgrade -y</code> (non-interactive, keeps existing config files). No root password or SSH is used; output streams here as the agent reports it.</p>' +
+        (n.updates != null ? '<p>' + (n.updates ? '<span class="warn-text">' + n.updates + ' pending update(s)' + (n.updates_kernel ? ', including a kernel — reboot the node afterwards to use it' : '') + '</span>' : '<span class="ok-text">No pending updates known</span> (apt-get update runs anyway)') + '.</p>' : "") +
+        (n.kernel_reboot_pending ? '<p class="bad-text">A reboot is already pending on this node (kernel ' + PM.esc(n.newest_kernel) + ' installed, running ' + PM.esc(n.kernel) + ').</p>' : "") +
+        '<p class="muted">Running guests are not affected by the update itself (' + guests + ' running now). Reboot stays a separate step: use Reboot node when it suits.</p>';
     } else if (kind === "upgrade") {
       title.textContent = "Update node " + node;
       body.innerHTML = '<p>Runs <code>apt-get update && apt-get dist-upgrade -y</code> (non-interactive, keeps existing config files) then <code>apt-get autoremove</code> on <b>' + PM.esc(node) + '</b>. The upgrade is started detached on the node, so it keeps going even if this page is closed; output streams here live.</p>' +
@@ -794,6 +922,41 @@
     } catch (err) { PM.toast(err.message, "bad"); PM.busy(btn, false); }
   }
 
+  // ---- update agent ----
+  let agentNode = "";
+  async function openAgentSetup(node) {
+    agentNode = node;
+    document.getElementById("agent-node").textContent = node;
+    document.getElementById("agent-status").textContent = "";
+    document.getElementById("agent-script").value = "Loading …";
+    PM.openModal("agent-modal");
+    try {
+      const r = await PM.api("GET", "/api/agent/installer");
+      document.getElementById("agent-script").value = r.script;
+      document.getElementById("agent-uninstall").textContent = r.uninstall;
+      document.getElementById("agent-key").textContent = r.key_fingerprint;
+    } catch (e) { document.getElementById("agent-script").value = e.message; }
+  }
+  if (document.getElementById("agent-modal")) {   // admins only (the modal isn't rendered for other roles)
+    document.getElementById("agent-copy").addEventListener("click", async function () {
+      const ta = document.getElementById("agent-script");
+      try { await navigator.clipboard.writeText(ta.value); PM.toast("Copied. Paste it into the node's terminal.", "ok"); }
+      catch (e) { ta.select(); document.execCommand("copy"); PM.toast("Copied.", "ok"); }
+    });
+    document.getElementById("agent-terminal").addEventListener("click", function () { startTerminal(agentNode); });
+    document.getElementById("agent-check").addEventListener("click", async function () {
+      const btn = this, st = document.getElementById("agent-status");
+      PM.busy(btn, true, "Checking (up to 45 s)");
+      st.className = "muted"; st.textContent = "Sent a signed ping; the agent checks every ~10 s …";
+      try {
+        const r = await PM.api("POST", "/api/hosts/" + HOST_ID + "/nodes/" + encodeURIComponent(agentNode) + "/agent/ping");
+        if (r.ok) { st.className = "ok-text"; st.textContent = "Agent ready on " + agentNode + " (version " + r.agent + "). 'Update node' is now available."; load(); }
+        else { st.className = "bad-text"; st.textContent = r.error; }
+      } catch (e) { st.className = "bad-text"; st.textContent = e.message; }
+      PM.busy(btn, false);
+    });
+  }
+
   function openJob(id) {
     watchingJob = id; jobOutputLen = 0;
     document.getElementById("job-output").textContent = "";
@@ -829,6 +992,13 @@
         cls = r.reboot_required && !r.rebooted ? "warn" : "ok";
         document.getElementById("job-reboot").style.display = (r.reboot_required && !r.rebooted && IS_ADMIN) ? "" : "none";
         document.getElementById("job-reboot").dataset.node = j.node;
+      } else if (j.kind === "agent_upgrade") {
+        html = r.reboot_required ? "<b>Update complete" + (r.upgraded ? " — " + PM.esc(r.upgraded) + " package(s) upgraded" : "") + ". Reboot required</b> to use the new kernel." :
+          r.upgraded === "0" ? "<b>Nothing to upgrade</b> — all packages are current. No reboot required." :
+          "<b>Update complete" + (r.upgraded ? " — " + PM.esc(r.upgraded) + " package(s) upgraded" : "") + ".</b> No reboot required.";
+        cls = r.reboot_required ? "warn" : "ok";
+        document.getElementById("job-reboot").style.display = (r.reboot_required && IS_ADMIN) ? "" : "none";
+        document.getElementById("job-reboot").dataset.node = j.node;
       } else if (j.kind === "check_updates") {
         html = (r.count ? "<b>" + r.count + " update(s) available</b>" + (r.kernel_in_updates && r.kernel_in_updates.length ? " including a kernel (reboot will be needed after upgrading)" : "") : (r.repo_errors && r.repo_errors.length ? "<b>No updates found in the repositories that could be read.</b>" : "<b>System is up to date.</b>")) + (r.reboot_required ? " · <b>Reboot already pending:</b> " + PM.esc(r.reboot_reason) : "");
         cls = r.count || r.reboot_required ? "warn" : "ok";
@@ -836,10 +1006,10 @@
         document.getElementById("job-reboot").dataset.node = j.node;
       } else if (j.kind === "switch_repos") {
         html = "<b>Repositories switched.</b> Disabled: " + PM.esc((r.disabled || []).join(", ") || "none") + " · Added: " + PM.esc((r.added || []).join(", ") || "none") + ". " +
-          (r.count ? "<b>" + r.count + " update(s) are now visible</b>" + (r.kernel_in_updates && r.kernel_in_updates.length ? " including a kernel" : "") + " — install them with " + (data.ssh_enabled ? "<b>Update node (SSH)</b>." : "<b>Upgrade shell ↗</b>.") : "Package lists refreshed; no updates pending.");
+          (r.count ? "<b>" + r.count + " update(s) are now visible</b>" + (r.kernel_in_updates && r.kernel_in_updates.length ? " including a kernel" : "") + " — install them with <b>Update node</b>" + (data.ssh_enabled ? " or <b>Update node (SSH)</b>." : ".") : "Package lists refreshed; no updates pending.");
         cls = r.repo_errors && r.repo_errors.length ? "warn" : "ok";
       } else if (j.kind === "refresh_packages") {
-        html = r.count ? "<b>" + r.count + " update(s) available</b>" + (r.kernel_in_updates && r.kernel_in_updates.length ? " including a kernel (reboot needed after upgrading)" : "") + ". Install them with <b>Upgrade shell ↗</b> on this node." : (r.repo_errors && r.repo_errors.length ? "<b>No updates found in the repositories that could be read.</b>" : "<b>Package lists refreshed — system is up to date.</b>");
+        html = r.count ? "<b>" + r.count + " update(s) available</b>" + (r.kernel_in_updates && r.kernel_in_updates.length ? " including a kernel (reboot needed after upgrading)" : "") + ". Install them with <b>Update node</b> on this node." : (r.repo_errors && r.repo_errors.length ? "<b>No updates found in the repositories that could be read.</b>" : "<b>Package lists refreshed — system is up to date.</b>");
         cls = r.count ? "warn" : "ok";
       } else if (j.kind === "reboot" || j.kind === "api_reboot") {
         html = "<b>Node is back</b> after " + PM.duration(r.seconds) + ". Kernel: " + PM.esc(r.running_kernel) + (r.kernel_changed ? " (was " + PM.esc(r.kernel_before) + ")" : " (unchanged)") + ".";
@@ -947,13 +1117,89 @@
   function startTerminal(node) {
     startConsole({ kind: "shell", node: node, what: "The terminal on " + node + " (" + (data ? data.name : "") + ")" });
   }
+  // No password dialog needed: a stored / saved root password, or a VM console on the host's API token
+  function autoLogin(target) {
+    if (!target || target.kind === "convert") return false;   // the switch dialog opens no console tab
+    return !!(data && (data.console_login || (target && target.kind === "vm" && data.vm_console_token)));
+  }
   function startConsole(target) {
     shellTarget = target;
     // a fresh re-auth first (the server refuses consoles without one)
     if (!PM.stepup.active()) { askStepup(target, ""); return; }
-    if (!data || !data.console_login) { askShellPassword(target, ""); return; }
+    if (!autoLogin(target)) { askShellPassword(target, ""); return; }
     runShell(target, "", false);
   }
+  // ---- switch to an API token ----
+  const PMM_PRIVS = ["Sys.Audit", "Sys.Modify", "Sys.PowerMgmt", "VM.Audit", "VM.PowerMgmt", "VM.Snapshot", "VM.Backup",
+    "VM.Config.Disk", "VM.Config.Options", "VM.Console", "Datastore.Audit", "Datastore.AllocateSpace", "Sys.Syslog"];
+  function convertSteps(steps) {
+    return '<ul class="convert-steps">' + (steps || []).map(function (x) {
+      return '<li class="' + (x.ok ? "ok-text" : "bad-text") + '">' + (x.ok ? "✓ " : "✗ ") + PM.esc(x.step) +
+        (x.detail ? ' <span class="muted">' + PM.esc(x.detail) + '</span>' : "") + '</li>';
+    }).join("") + '</ul>';
+  }
+  const convertOpen = document.getElementById("convert-open");
+  if (convertOpen) convertOpen.addEventListener("click", function () {
+    document.getElementById("convert-host").textContent = data ? data.name : "";
+    document.getElementById("convert-privs").textContent = PMM_PRIVS.join(", ");
+    const tokenHost = data && data.auth_type === "token";
+    document.getElementById("convert-token-opts").style.display = tokenHost ? "" : "none";
+    document.getElementById("convert-old-token").textContent = tokenHost ? (data.token_id || "") : "";
+    document.getElementById("convert-remove-old").checked = true;
+    document.getElementById("convert-pw").value = "";
+    document.getElementById("convert-intro").style.display = "";
+    document.getElementById("convert-result").style.display = "none";
+    document.getElementById("convert-err").style.display = "none";
+    const go = document.getElementById("convert-go");
+    go.style.display = ""; go.disabled = false; go.textContent = "Switch to API token";
+    document.getElementById("convert-cancel").textContent = "Cancel";
+    PM.openModal("convert-modal");
+  });
+  const convertGo = document.getElementById("convert-go");
+  if (convertGo) convertGo.addEventListener("click", function () {
+    if (!PM.stepup.active()) { PM.closeModal("convert-modal"); askStepup({ kind: "convert" }, ""); return; }
+    runConvert();
+  });
+  async function runConvert() {
+    PM.openModal("convert-modal");
+    const go = document.getElementById("convert-go"), err = document.getElementById("convert-err");
+    const out = document.getElementById("convert-result");
+    go.disabled = true; go.innerHTML = '<span class="spin"></span> Switching …';
+    err.style.display = "none";
+    try {
+      const pwEl = document.getElementById("convert-pw");
+      const r = await PM.api("POST", "/api/hosts/" + HOST_ID + "/convert-to-token",
+        { password: pwEl ? pwEl.value : "", remove_old_token: document.getElementById("convert-remove-old").checked });
+      if (pwEl) pwEl.value = "";
+      document.getElementById("convert-intro").style.display = "none";
+      out.style.display = "";
+      out.innerHTML = '<p style="margin-top:0" class="ok-text"><b>Done.</b> ' + PM.esc(r.host) + ' now uses the API token.</p>' +
+        '<table class="kvtable"><tbody>' +
+        '<tr><th>User</th><td class="mono">' + PM.esc(r.user) + '</td></tr>' +
+        '<tr><th>Role</th><td><span class="mono">' + PM.esc(r.role) + '</span> <span class="muted">' + PM.esc(r.privs.join(", ")) + '</span></td></tr>' +
+        '<tr><th>Token</th><td class="mono">' + PM.esc(r.token_id) + '</td></tr>' +
+        '<tr><th>Checked</th><td>' + r.nodes.length + ' node(s), ' + r.guests + ' guest(s)</td></tr>' +
+        '<tr><th>Password</th><td>pmm@pve has a random password nobody knows (not shown, not stored). The root@pam ' + (r.old_token ? "token" : "password") + ' was removed from the dashboard.</td></tr>' +
+        (r.old_token ? '<tr><th>Old token</th><td><span class="mono">' + PM.esc(r.old_token) + '</span> ' +
+          (r.old_token_removed ? '<span class="ok-text">removed from the host</span>' : '<span class="bad-text">still on the host: remove it (see the steps below)</span>') + '</td></tr>' : "") +
+        '</tbody></table>' + convertSteps(r.steps);
+      go.style.display = "none";
+      document.getElementById("convert-cancel").textContent = "Close";
+      load();
+    } catch (e) {
+      if (e.data && e.data.stepup_required) {
+        PM.closeModal("convert-modal");
+        PM.stepup.set(Object.assign({}, PM.stepup.state || {}, { active: false, remaining: 0, methods: e.data.methods }));
+        if (!(e.data.methods || []).length) PM.toast(e.message, "bad"); else askStepup({ kind: "convert" }, "");
+        return;
+      }
+      const d = e.data && e.data.detail && typeof e.data.detail === "object" ? e.data.detail : null;
+      err.innerHTML = '<b>Not switched:</b> ' + PM.esc(d ? d.message : e.message) + (d && d.steps ? convertSteps(d.steps) : "");
+      err.style.display = "";
+      go.disabled = false; go.textContent = "Try again";
+    }
+  }
+
   let stepupTarget = null;
   function askStepup(target, err, loaded) {
     stepupTarget = target;
@@ -962,11 +1208,18 @@
     const methods = (st && st.methods) || ["totp"];
     if (st && !methods.length) { PM.toast(st.blocked_reason || "Consoles aren't available for your account.", "bad"); return; }
     const entra = methods.indexOf("entra") !== -1;
+    const why = document.getElementById("stepup-why");
+    if (why) {
+      if (!why.dataset.consoleText) why.dataset.consoleText = why.innerHTML;
+      why.innerHTML = target && target.kind === "convert"
+        ? "Switching this host to an API token needs a fresh check, even when you're signed in. The same check also lets you open consoles from this browser for <b id=\"stepup-mins\">15</b> minutes."
+        : why.dataset.consoleText;
+    }
     document.getElementById("stepup-mins").textContent = st ? Math.round(st.window_minutes) : 15;
     document.getElementById("stepup-totp").style.display = entra ? "none" : "";
     document.getElementById("stepup-entra").style.display = entra ? "" : "none";
     const go = document.getElementById("stepup-go");
-    go.textContent = entra ? "Sign in with Microsoft" : (data && data.console_login ? "Verify and open" : "Verify");
+    go.textContent = entra ? "Sign in with Microsoft" : (autoLogin(target) ? "Verify and open" : "Verify");
     go.disabled = false;
     document.getElementById("stepup-code").value = "";
     const e = document.getElementById("stepup-err");
@@ -985,8 +1238,8 @@
     if (!/^\d{6}$/.test(code)) { err.textContent = "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
     const target = stepupTarget;
     // With a saved root password no other dialog follows, so open the tab now, inside the click.
-    const w = data && data.console_login ? window.open("about:blank", "pmconsole_" + Date.now()) : null;
-    if (data && data.console_login && !w) { PM.toast("The browser blocked the new tab. Allow pop-ups for this dashboard and try again.", "bad"); return; }
+    const w = autoLogin(target) ? window.open("about:blank", "pmconsole_" + Date.now()) : null;
+    if (autoLogin(target) && !w) { PM.toast("The browser blocked the new tab. Allow pop-ups for this dashboard and try again.", "bad"); return; }
     if (w) shellMsg(w, "Verifying …");
     const go = this;
     go.disabled = true;
@@ -1000,6 +1253,7 @@
       return;
     }
     PM.closeModal("stepup-modal");
+    if (target && target.kind === "convert") { runConvert(); return; }
     if (w) runShell(target, "", false, w); else askShellPassword(target, "");
   });
   document.getElementById("stepup-code").addEventListener("keydown", function (e) {
@@ -1391,6 +1645,8 @@
     if (t.hasAttribute("data-reboot")) { openConfirm("reboot", t.getAttribute("data-reboot"), t.getAttribute("data-via")); return; }
     if (t.hasAttribute("data-switch-repos")) { openConfirm("switch-repos", t.getAttribute("data-switch-repos")); return; }
     if (t.hasAttribute("data-refresh-pkgs")) { startCheck(t.getAttribute("data-refresh-pkgs"), t, "refresh-packages"); return; }
+    if (t.hasAttribute("data-agent-setup")) { openAgentSetup(t.getAttribute("data-agent-setup")); return; }
+    if (t.hasAttribute("data-agent-upgrade")) { openConfirm("agent-upgrade", t.getAttribute("data-agent-upgrade")); return; }
     if (t.hasAttribute("data-job")) { openJob(parseInt(t.getAttribute("data-job"), 10)); return; }
     if (t.hasAttribute("data-copy-ip")) { PM.copy(t.getAttribute("data-copy-ip"), "IP address"); return; }
     if (t.hasAttribute("data-toggle-disks")) {

@@ -1,3 +1,3 @@
 """Proxmox Manager - multi-host Proxmox VE dashboard."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"

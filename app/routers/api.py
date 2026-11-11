@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -28,8 +29,8 @@ from ..auth import (
     verify_password,
 )
 from ..config import settings
-from ..database import get_db
-from ..models import Job, ProxmoxHost, SmartResult, StatSample, User, node_names_of
+from ..database import db_session, get_db
+from ..models import Job, ProxmoxHost, SmartResult, StatSample, User, clean_tags, node_names_of, tags_of
 from ..poller import poller
 from ..templating import clean_theme, theme_cookie
 from ..pve import (
@@ -40,6 +41,7 @@ from ..pve import (
     forget_guest_disks,
     list_disks,
     node_network,
+    package_changelog,
     read_smart,
     test_connection,
 )
@@ -55,6 +57,7 @@ def _node_param_ok(request: Request) -> None:
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_same_origin), Depends(_node_param_ok)])
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +79,40 @@ def _summary(host: ProxmoxHost) -> dict | None:
         return json.loads(host.last_summary_json)
     except json.JSONDecodeError:
         return None
+
+
+def _unreachable_view(s: dict | None) -> dict | None:
+    """the last summary of a host that doesn't answer any more. Its nodes and guests are
+    shown as unreachable / unknown (their last reported state kept for the tooltip) instead of the stale
+    'online' / 'running'; the figures stay as the last known ones."""
+    if not s:
+        return s
+    s = copy.deepcopy(s)
+    s["unreachable"] = True
+    for n in s.get("nodes") or []:
+        n["last_status"] = n.get("status", "")
+        n["status"] = "unreachable"
+        n["online"] = False
+    s["nodes_online"] = 0
+    for g in s.get("guests") or []:
+        if not g.get("node_offline"):
+            g["last_status"] = g.get("status", "")
+        g.update({"status": "unknown", "node_offline": True, "unreachable": True, "cpu_pct": 0.0, "mem_used": 0, "mem_pct": 0.0, "uptime": 0})
+    if s.get("guests") is not None:
+        s["guests_unknown"] = len(s["guests"])
+    else:
+        s["guests_unknown"] = (s.get("guests_running") or 0) + (s.get("guests_stopped") or 0) + (s.get("guests_unknown") or 0)
+    s["guests_running"] = s["guests_stopped"] = 0
+    for st in s.get("storages") or []:
+        st["node_offline"] = True
+        st["unreachable"] = True
+    return s
+
+
+def _summary_view(host: ProxmoxHost) -> dict | None:
+    """The summary as pages show it: unreachable hosts get _unreachable_view."""
+    s = _summary(host)
+    return _unreachable_view(s) if (s and host.enabled and host.last_error) else s
 
 
 def _averages(db: Session, host_ids: list[int]) -> dict[int, dict]:
@@ -113,6 +150,18 @@ def _console_source(host: ProxmoxHost) -> str:
     return "saved" if host.console_secret_enc else ""
 
 
+def _agents(host: ProxmoxHost) -> dict:
+    from .. import agent
+
+    return agent.agents_of(host)
+
+
+def _vm_console_token(host: ProxmoxHost) -> bool:
+    from .. import consoles
+
+    return consoles.token_vm_consoles(host)
+
+
 def _host_public(host: ProxmoxHost, include_config: bool = False) -> dict:
     data = {
         "id": host.id,
@@ -127,7 +176,12 @@ def _host_public(host: ProxmoxHost, include_config: bool = False) -> dict:
         "last_ok_at": _iso(host.last_ok_at),
         "last_error": host.last_error,
         "console_login": _console_source(host),
+        # VM consoles open on the host's API token (no root password)
+        "vm_console_token": _vm_console_token(host),
+        # nodes with the update agent
+        "agents": _agents(host),
         "node_names": node_names_of(host),
+        "tags": tags_of(host),
     }
     if include_config:
         data.update(
@@ -203,7 +257,7 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_user))
         "repo_warnings": 0,
     }
     for h in hosts:
-        s = _summary(h)
+        s = _summary_view(h)
         entry = _host_public(h)
         entry["summary"] = None
         entry["average"] = averages.get(h.id)
@@ -333,7 +387,9 @@ class HostIn(BaseModel):
     ssh_auth: Literal["appkey", "key", "password"] = "appkey"
     ssh_secret: str = Field(default="", max_length=16000)  # pasted private key or password; blank on edit = keep
     ssh_node_addrs: str = Field(default="", max_length=4000)  # "node=address" per line
+    ssh_host_key: str | None = Field(default=None, max_length=128)   # confirmed SSH host key (None = unchanged)
     node_names: dict[str, str] | None = None   # {"node": "friendly name"}; None = leave unchanged
+    tags: list[str] | None = Field(default=None, max_length=200)   # None = leave unchanged
     # the certificate fingerprint shown by "Test connection", pinned on save
     tls_fingerprint: str = Field(default="", max_length=100)
 
@@ -350,6 +406,11 @@ class HostIn(BaseModel):
         self.ssh_node_addrs = _parse_node_addrs(self.ssh_node_addrs)
         if self.node_names is not None:
             self.node_names = _clean_node_names(self.node_names)
+        if self.tags is not None:
+            try:
+                self.tags = clean_tags(self.tags)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
         if self.auth_type == "token":
             # Accept the Token ID in either field; people paste "root@pam!name" where the user goes.
@@ -396,6 +457,7 @@ async def hosts_create(body: HostIn, db: Session = Depends(get_db), user: User =
     host = ProxmoxHost(
         name=body.name.strip(),
         client=body.client.strip(),
+        tags=json.dumps(body.tags or []),
         host=body.host.strip(),
         port=body.port,
         web_url=body.web_url.strip(),
@@ -412,8 +474,11 @@ async def hosts_create(body: HostIn, db: Session = Depends(get_db), user: User =
         ssh_auth=body.ssh_auth,
         ssh_secret_enc=crypto.encrypt(body.ssh_secret) if body.ssh_secret else "",
         ssh_node_addrs=body.ssh_node_addrs,
+        ssh_host_key=(body.ssh_host_key or "").strip(),
         node_names=json.dumps(body.node_names) if body.node_names else "",
-        tls_fingerprint="" if body.verify_ssl else tlspin.normalize(body.tls_fingerprint),
+        # the confirmed fingerprint, or the pin another saved host already holds for this address
+        tls_fingerprint="" if body.verify_ssl else (tlspin.normalize(body.tls_fingerprint)
+                                                     or tlspin.saved_pin(body.host.strip(), body.port)),
     )
     db.add(host)
     db.commit()
@@ -434,7 +499,7 @@ def host_detail(
 ):
     host = _get_host(db, host_id)
     data = _host_public(host, include_config=user.is_admin)
-    data["summary"] = _summary(host)
+    data["summary"] = _summary_view(host)
     data["average"] = _averages(db, [host.id]).get(host.id)
     data["history"] = _history(db, host.id, hours=hours)
     data["history_hours"] = hours
@@ -488,6 +553,8 @@ async def hosts_update(
                                  "there. Enter it again to save these settings.")
     host.name = body.name.strip()
     host.client = body.client.strip()
+    if body.tags is not None:
+        host.tags = json.dumps(body.tags)
     host.host = body.host.strip()
     host.port = body.port
     host.web_url = body.web_url.strip()
@@ -506,13 +573,19 @@ async def hosts_update(
     if body.ssh_secret:
         host.ssh_secret_enc = crypto.encrypt(body.ssh_secret)
     host.ssh_node_addrs = body.ssh_node_addrs
+    if body.ssh_host_key is not None:
+        host.ssh_host_key = body.ssh_host_key.strip()
     if body.node_names is not None:
         host.node_names = json.dumps(body.node_names) if body.node_names else ""
     if new_target != _old_target and not same_machine:
-        # a different machine gets a new pin (the one the admin just tested, else pinned on
-        # first use at the next poll) and the saved root@pam console password is not sent to it
-        host.tls_fingerprint = "" if host.verify_ssl else tlspin.normalize(body.tls_fingerprint)
+        # a different machine gets a new pin (the one the admin just confirmed, else nothing is
+        # sent until the certificate is confirmed) and the saved root@pam console password is not sent to it
+        host.tls_fingerprint = "" if host.verify_ssl else (tlspin.normalize(body.tls_fingerprint)
+                                                            or tlspin.saved_pin(host.host, host.port))
         host.console_secret_enc = ""
+        if body.ssh_host_key is None:
+            host.ssh_host_key = ""
+        host.network_json = ""   # last known network info belonged to the old machine
     if not host.enabled:
         host.last_error = ""
     db.commit()
@@ -532,7 +605,7 @@ async def hosts_update(
 
 
 _HOST_AUDIT_FIELDS = ("name", "client", "host", "port", "web_url", "verify_ssl", "auth_type", "pve_user", "token_name",
-                      "enabled", "notes", "ssh_enabled", "ssh_user", "ssh_port", "ssh_auth", "ssh_node_addrs", "node_names",
+                      "enabled", "notes", "ssh_enabled", "ssh_user", "ssh_port", "ssh_auth", "ssh_node_addrs", "node_names", "tags",
                       "tls_fingerprint")
 
 
@@ -553,8 +626,39 @@ class TestIn(HostIn):
     host_id: int | None = None  # when editing, lets a blank secret reuse the stored one
 
 
+def _outbound_guard(request: Request, db: Session, user: User, kind: str, address: str, port: int,
+                    host_id: int | None) -> tuple[str, bool]:
+    """a fresh re-auth for addresses that aren't managed
+    hosts, and per-admin / per-target limits. Returns (target key, managed)."""
+    from .. import outbound
+    from .console import _require_stepup
+
+    managed = outbound.is_managed(db, address)
+    if not managed:
+        _require_stepup(request, db, user)
+    key = outbound.target_key(kind, address, port)
+    try:
+        outbound.check(user.id, key)
+    except outbound.Throttled as exc:
+        note_current(outcome="denied", details={"throttled": str(exc), "target": key})
+        raise HTTPException(429, str(exc), headers={"Retry-After": str(exc.retry_after)}) from exc
+    note_current(details={"target": key, "managed": managed})
+    return key, managed
+
+
+def _outbound_record(request: Request, user: User, key: str, managed: bool, outcome: str) -> None:
+    from .. import outbound
+
+    outbound.record(user.id, user.username, key, outcome, managed, request.client.host if request.client else "")
+
+
+def _pve_outcome(msg: str) -> str:
+    low = (msg or "").lower()
+    return "auth_failed" if ("authentication failed" in low or "permission denied" in low or "401" in low) else "error"
+
+
 @router.post("/hosts/test")
-async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+async def hosts_test(body: TestIn, request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     body.validate_auth(editing=body.host_id is not None)
     secret = body.secret
     existing = _get_host(db, body.host_id) if body.host_id is not None else None
@@ -568,6 +672,8 @@ async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = D
             return {"ok": False, "error": "The address or account differs from the saved host, so the saved "
                                           "token / password is not sent. Enter it to test these settings."}
         secret = crypto.decrypt(existing.secret_enc)
+    key, managed = _outbound_guard(request, db, user, "pve", body.host, body.port, body.host_id)
+    pinned = existing.tls_fingerprint if (existing is not None and same_target and not body.verify_ssl) else ""
     probe = ProxmoxHost(
         name=body.name,
         host=body.host.strip(),
@@ -577,15 +683,25 @@ async def hosts_test(body: TestIn, db: Session = Depends(get_db), user: User = D
         pve_user=body.pve_user.strip(),
         token_name=body.token_name.strip(),
         secret_enc="",
-        tls_fingerprint=(existing.tls_fingerprint if same_target and existing.verify_ssl == body.verify_ssl else ""),
+        tls_fingerprint=pinned or tlspin.normalize(body.tls_fingerprint),
     )
+    if not body.verify_ssl and not probe.tls_fingerprint and not tlspin.saved_pin(probe.host, probe.port):
+        # show the certificate first; the token / password is only sent once the admin confirmed it
+        try:
+            fp = await asyncio.to_thread(tlspin.fetch, probe.host, probe.port, 10)
+        except Exception as exc:  # noqa: BLE001
+            _outbound_record(request, user, key, managed, "error")
+            return {"ok": False, "error": f"Could not reach {probe.host}:{probe.port} ({exc.__class__.__name__})."}
+        _outbound_record(request, user, key, managed, "confirm")
+        return {"ok": False, "needs_confirm": True, "tls_fingerprint": tlspin.pretty(fp),
+                "error": "Confirm the host's certificate first: nothing has been sent to it yet."}
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(None, test_connection, probe, secret)
-    except PveError as exc:
+    except (PveError, ValueError) as exc:
+        _outbound_record(request, user, key, managed, _pve_outcome(str(exc)))
         return {"ok": False, "error": str(exc)}
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    _outbound_record(request, user, key, managed, "ok")
     return {"ok": True, **result}
 
 
@@ -640,6 +756,40 @@ async def host_tls_accept(host_id: int, body: TlsAcceptIn, db: Session = Depends
     return {"ok": True, "pinned": tlspin.pretty(want)}
 
 
+class ConvertIn(BaseModel):
+    password: str = Field(default="", max_length=512)   # optional typed root@pam password (never stored)
+    remove_old_token: bool = True
+
+
+@router.post("/hosts/{host_id}/convert-to-token")
+async def hosts_convert_to_token(host_id: int, request: Request, body: ConvertIn | None = None,
+                                 db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """switch a root@pam password host to a pmm@pve API token with the PMM role
+    (app/convert.py). Admins only, after a fresh re-auth (it creates an account on the client's host)."""
+    from .. import consoles, convert
+    from .console import _require_stepup
+
+    _require_stepup(request, db, user)
+    host = _get_host(db, host_id)
+    note_current(action="host.convert_token", host_name=host.name)
+    body = body or ConvertIn()
+    try:
+        res = await asyncio.to_thread(convert.convert, host_id, body.password, body.remove_old_token)
+    except convert.ConvertError as exc:
+        note_current(outcome="failed", details={"error": str(exc)[:300], "steps": [x["step"] for x in exc.steps][-8:]})
+        raise HTTPException(409, {"message": str(exc), "steps": exc.steps}) from exc
+    consoles.unblock_token(host_id)
+    from ..pve import forget_guest_disks
+
+    forget_guest_disks(host_id)
+    note_current(details={"user": res["user"], "role": res["role"], "token_id": res["token_id"], "nodes": res["nodes"],
+                          "guests": res["guests"], "created_user": res["created_user"], "created_role": res["created_role"],
+                          "root_password_removed": True, "old_token": res.get("old_token", ""),
+                          "old_token_removed": res.get("old_token_removed", False), "typed_password": bool(body.password)})
+    asyncio.create_task(poller.poll_one_now(host_id))
+    return res
+
+
 @router.post("/hosts/{host_id}/refresh")
 async def hosts_refresh(host_id: int, db: Session = Depends(get_db), user: User = Depends(require_user)):
     host = _get_host(db, host_id)
@@ -680,10 +830,11 @@ class SshTestIn(BaseModel):
     ssh_port: int = Field(default=22, ge=1, le=65535)
     ssh_auth: Literal["appkey", "key", "password"] = "appkey"
     ssh_secret: str = Field(default="", max_length=16000)
+    ssh_host_key: str = Field(default="", max_length=128)   # SSH host key fingerprint the admin confirmed
 
 
 @router.post("/ssh/test")
-async def ssh_test(body: SshTestIn, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+async def ssh_test(body: SshTestIn, request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     """Test SSH to the host's main address with the credentials in the form (saved or not)."""
     secret = body.ssh_secret
     if body.ssh_auth != "appkey" and not secret:
@@ -698,22 +849,32 @@ async def ssh_test(body: SshTestIn, db: Session = Depends(get_db), user: User = 
             secret = crypto.decrypt(h.ssh_secret_enc) if h.ssh_secret_enc else ""
         if not secret:
             return {"ok": False, "error": "Enter the SSH private key / password first."}
+    key, managed = _outbound_guard(request, db, user, "ssh", body.host, body.ssh_port, body.host_id)
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(
-            None, ssh.probe, db, body.host.strip(), body.ssh_port, body.ssh_user.strip() or "root", body.ssh_auth, secret
+            None, ssh.probe, db, body.host.strip(), body.ssh_port, body.ssh_user.strip() or "root", body.ssh_auth, secret,
+            body.ssh_host_key.strip()
         )
+    except ssh.HostKeyConfirm as exc:
+        _outbound_record(request, user, key, managed, "confirm")
+        return {"ok": False, "needs_confirm": True, "ssh_host_key": exc.fingerprint,
+                "error": "Confirm the node's SSH host key first: the password has not been sent."}
     except (ssh.SshError, ValueError) as exc:
+        _outbound_record(request, user, key, managed, "auth_failed" if "authentication failed" in str(exc).lower() else "error")
         return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        log.exception("SSH test to %s failed", body.host)
+        _outbound_record(request, user, key, managed, "error")
+        return {"ok": False, "error": f"SSH test failed ({exc.__class__.__name__}); details are in the service log."}
+    _outbound_record(request, user, key, managed, "ok")
     if result["ok"] and not result["is_root"]:
         result["warning"] = f"Connected as a non-root user ({body.ssh_user}); apt upgrades and reboots need root."
     return result
 
 
 @router.post("/hosts/{host_id}/ssh/enable")
-async def ssh_enable(host_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+async def ssh_enable(host_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     """One-click from the SSH key card: test the dashboard key against the host and,
     if it works, turn SSH on (dashboard key, root, existing port or 22)."""
     host = _get_host(db, host_id)
@@ -722,13 +883,22 @@ async def ssh_enable(host_id: int, db: Session = Depends(get_db), user: User = D
     port = host.ssh_port or 22
     username = host.ssh_user or "root"
     address = ssh.node_address(host, ((_summary(host) or {}).get("nodes") or [{}])[0].get("node", ""), _summary(host))
+    key, managed = _outbound_guard(request, db, user, "ssh", address, port, host_id)
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(None, ssh.probe, db, address, port, username, auth, secret)
+        result = await loop.run_in_executor(None, ssh.probe, db, address, port, username, auth, secret, host.ssh_host_key)
+    except ssh.HostKeyConfirm as exc:
+        _outbound_record(request, user, key, managed, "confirm")
+        return {"ok": False, "error": f"The node's SSH host key ({exc.fingerprint}) hasn't been confirmed. Edit the host and "
+                                      "use Test SSH to confirm it, or use the dashboard key."}
     except (ssh.SshError, ValueError) as exc:
+        _outbound_record(request, user, key, managed, "auth_failed" if "authentication failed" in str(exc).lower() else "error")
         return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        log.exception("SSH enable for %s failed", host.name)
+        _outbound_record(request, user, key, managed, "error")
+        return {"ok": False, "error": f"SSH test failed ({exc.__class__.__name__}); details are in the service log."}
+    _outbound_record(request, user, key, managed, "ok")
     if not result.get("ok"):
         return {"ok": False, "error": "Connected, but the test command failed."}
     if not result.get("is_root"):
@@ -826,6 +996,56 @@ def node_reboot(host_id: int, node: str, body: JobIn, db: Session = Depends(get_
     if body.confirm.strip() != node:
         raise HTTPException(400, f"Type the node name '{node}' to confirm the reboot")
     return _start(host, node, "reboot", user, {})
+
+
+# --------------------------------------------------------------------------- #
+# Update agent
+# --------------------------------------------------------------------------- #
+
+@router.get("/agent/installer")
+def agent_installer(user: User = Depends(require_admin)):
+    """The block to paste once into a node's shell (root) to install the update agent."""
+    from .. import agent
+
+    return {"script": agent.installer(), "uninstall": agent.UNINSTALL, "key_fingerprint": agent.public_fingerprint(),
+            "version": agent.AGENT_VERSION}
+
+
+@router.post("/hosts/{host_id}/nodes/{node}/agent/ping")
+async def agent_ping(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """Check that the node's update agent answers a signed request (takes up to ~45 s)."""
+    from .. import agent
+
+    host = _get_host(db, host_id)
+    _check_node(host, node, needs_ssh=False)
+
+    def run():
+        from ..pve import connect as pve_connect
+
+        return agent.ping(pve_connect(host), node)
+    try:
+        res = await asyncio.to_thread(run)
+    except agent.AgentError as exc:
+        note_current(outcome="failed", node=node, details={"error": str(exc)[:200]})
+        return {"ok": False, "error": str(exc)}
+    except PveError as exc:
+        return {"ok": False, "error": str(exc)}
+    agent.mark_seen(host.id, node, res["agent"])
+    note_current(action="agent.ping", node=node, details={"agent": res["agent"]})
+    return {"ok": True, "agent": res["agent"]}
+
+
+@router.post("/hosts/{host_id}/nodes/{node}/agent/upgrade", status_code=202)
+def agent_upgrade(host_id: int, node: str, body: JobIn, db: Session = Depends(get_db),
+                  user: User = Depends(require_admin)):
+    """Install the node's pending updates through the update agent (job)."""
+    host = _get_host(db, host_id)
+    _check_node(host, node, needs_ssh=False)
+    if node not in _agents(host):
+        raise HTTPException(409, f"The update agent isn't set up on {node} yet: use 'Set up updates' first.")
+    if body.confirm.strip() != node:
+        raise HTTPException(400, f"Type the node name '{node}' to confirm the update")
+    return _start(host, node, "agent_upgrade", user, {})
 
 
 @router.post("/hosts/{host_id}/nodes/{node}/refresh-packages", status_code=202)
@@ -1071,20 +1291,101 @@ def host_jobs(host_id: int, db: Session = Depends(get_db), user: User = Depends(
 # --------------------------------------------------------------------------- #
 
 @router.get("/hosts/{host_id}/nodes/{node}/network")
-async def node_network_get(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """Read-only: interfaces, addresses, bridges / bonds / VLANs and DNS of one node (every role)."""
+async def node_network_get(host_id: int, node: str, cached: bool = Query(default=False), db: Session = Depends(get_db),
+                           user: User = Depends(require_user)):
+    """Read-only: interfaces, addresses, bridges / bonds / VLANs and DNS of one node (every role).
+    each good read is saved; cached=1 (node or host not reachable) returns the saved copy without
+    contacting the host, and a failed live read falls back to it. Both are marked stale with their date."""
     host = _get_host(db, host_id)
     if not _NODE_NAME_RE.fullmatch(node):
         raise HTTPException(404, "Unknown node")
     _check_node(host, node, needs_ssh=False)
+    s = _summary(host) or {}
+    mgmt = next((n.get("ip", "") for n in s.get("nodes", []) if n.get("node") == node), "")
+    saved = _saved_network(host).get(node)
+    if cached:
+        if not saved:
+            raise HTTPException(404, "No network information has been saved for this node yet.")
+        return {"node": node, "management_ip": mgmt, **saved["net"], "stale": True, "as_of": saved.get("at", "")}
     loop = asyncio.get_running_loop()
     try:
         net = await loop.run_in_executor(None, node_network, host, node)
     except (PveError, ValueError) as exc:
+        if saved:
+            return {"node": node, "management_ip": mgmt, **saved["net"], "stale": True, "as_of": saved.get("at", ""),
+                    "live_error": str(exc)}
         raise HTTPException(502, str(exc))
-    s = _summary(host) or {}
-    mgmt = next((n.get("ip", "") for n in s.get("nodes", []) if n.get("node") == node), "")
+    _save_network(host_id, node, net, [n.get("node") for n in s.get("nodes", [])])
     return {"node": node, "management_ip": mgmt, **net}
+
+
+def _saved_network(host: ProxmoxHost) -> dict:
+    try:
+        d = json.loads(host.network_json or "{}")
+    except ValueError:
+        return {}
+    return {k: v for k, v in d.items() if isinstance(v, dict) and isinstance(v.get("net"), dict)} if isinstance(d, dict) else {}
+
+
+def _save_network(host_id: int, node: str, net: dict, nodes: list) -> None:
+    """Keep the last good read of each node (only nodes the host still reports)."""
+    with db_session() as db:
+        h = db.get(ProxmoxHost, host_id)
+        if h is None:
+            return
+        d = _saved_network(h)
+        d[node] = {"at": _iso(datetime.now(timezone.utc)), "net": net}
+        keep = set(nodes) | {node}
+        h.network_json = json.dumps({k: v for k, v in d.items() if k in keep})
+
+
+# --------------------------------------------------------------------------- #
+# Update notes: what a pending package update changes, and which CVEs it names
+# --------------------------------------------------------------------------- #
+
+_changelog_sem = asyncio.Semaphore(4)   # changelog downloads running on the nodes at once (all users)
+
+
+@router.get("/hosts/{host_id}/nodes/{node}/updates/notes")
+async def update_notes(host_id: int, node: str, name: str = Query(max_length=100), version: str = Query(max_length=100),
+                       db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """Cliff notes for one pending update (every role: read-only). Only packages that the last poll
+    listed as pending on that node can be asked for."""
+    from .. import changelog
+
+    host = _get_host(db, host_id)
+    if not changelog.PACKAGE_RE.fullmatch(name) or not changelog.VERSION_RE.fullmatch(version):
+        raise HTTPException(404, "Not a pending update on this node")
+    _check_node(host, node, needs_ssh=False)
+    s = _summary(host) or {}
+    n = next((x for x in s.get("nodes", []) if x.get("node") == node), None)
+    upd = next((u for u in (n or {}).get("updates_list") or [] if u.get("package") == name and u.get("new") == version), None)
+    if upd is None:
+        raise HTTPException(404, "Not a pending update on this node (refresh the host if the list changed)")
+    old = upd.get("old") or ""
+    key = (host.id, name, version, old)
+    hit = changelog.cached(key)
+    if hit is None:
+        async with _changelog_sem:
+            hit = changelog.cached(key)
+            if hit is None:
+                loop = asyncio.get_running_loop()
+                try:
+                    text = await asyncio.wait_for(loop.run_in_executor(None, package_changelog, host, node, name, version), timeout=45)
+                    hit = {"ok": True, **changelog.notes(text, old, version)}
+                    if not text.strip():
+                        hit = {"ok": False, "error": "The repository has no changelog for this version."}
+                    changelog.store(key, hit, error=not hit["ok"])
+                except asyncio.TimeoutError:
+                    hit = {"ok": False, "error": "The node took too long to download the changelog."}
+                    changelog.store(key, hit, error=True)
+                except (PveError, ValueError) as exc:
+                    msg = str(exc)
+                    if "403" in msg or "ermission" in msg:
+                        msg = "The API token can't read changelogs (needs Sys.Modify on the node, like the update list)."
+                    hit = {"ok": False, "error": msg[:300]}
+                    changelog.store(key, hit, error=True)
+    return {"package": name, "old": old, "new": version, "title": upd.get("title", ""), "origin": upd.get("origin", ""), **hit}
 
 
 # --------------------------------------------------------------------------- #
@@ -1094,6 +1395,7 @@ async def node_network_get(host_id: int, node: str, db: Session = Depends(get_db
 @router.get("/hosts/{host_id}/nodes/{node}/disks")
 async def node_disks(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
     host = _get_host(db, host_id)
+    _check_node(host, node, needs_ssh=False)   # known node of an enabled host
     loop = asyncio.get_running_loop()
     try:
         disks = await loop.run_in_executor(None, list_disks, host, node)
@@ -1145,6 +1447,7 @@ async def node_smart(
 ):
     """Read SMART health + attributes for one disk (runs smartctl on the node via the PVE API)."""
     host = _get_host(db, host_id)
+    _check_node(host, node, needs_ssh=False)   # known node of an enabled host
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(None, read_smart, host, node, body.devpath)
@@ -1157,6 +1460,7 @@ async def node_smart(
 async def node_smart_all(host_id: int, node: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
     """Read SMART for every physical disk on a node."""
     host = _get_host(db, host_id)
+    _check_node(host, node, needs_ssh=False)   # known node of an enabled host
     loop = asyncio.get_running_loop()
     try:
         disks = await loop.run_in_executor(None, list_disks, host, node)

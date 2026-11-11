@@ -44,19 +44,24 @@ run on an isolated management network.
 - Storage inventory with usage; shared storage is counted once per cluster
 - Physical disks per node (model, serial, type, size, Proxmox health, SSD wear) and on-demand
   SMART reads with stored results
-- Pending apt updates per node, kernel updates flagged, and reboot-pending detection
+- Pending apt updates per node with notes from the package changelogs and a CVE check, kernel
+  updates flagged, and reboot-pending detection
   (installed kernel newer than the running kernel)
 - Detection of enterprise repositories configured without a subscription
-- Fleet summary with grouping by client, sorting and free-text filtering
+- Fleet summary with grouping by client, free-form host tags with tag filters, sorting and
+  free-text filtering
+- When a host stops answering: when it was last up and last tried, its nodes and guests shown as
+  down or unknown, and the last known network information
 
 **Node maintenance** (admin)
 
 - Package list refresh and node reboot through the Proxmox API
-- Node terminal (root shell, as Node → Shell) and interactive upgrade shell (`pveupgrade`),
-  relayed through the dashboard
+- Node terminal (root shell, as Node → Shell), relayed through the dashboard
+- One-click node updates through a small update agent on the node (no root password, no SSH, no new port)
 - Optional SSH mode: unattended `dist-upgrade` with live output, reboot-required analysis and
   optional automatic reboot
 - One-step switch from enterprise to no-subscription repositories
+- One-click switch of a root@pam host to a dedicated `pmm@pve` API token with a least-privilege role
 
 **Guest operations** (admin)
 
@@ -73,8 +78,9 @@ run on an isolated management network.
   authenticator app (TOTP); Microsoft Entra ID single sign-on with app roles
 - `admin`, `technician` and `viewer` roles, sign-in throttling, administrator-set passwords
   replaced at first sign-in, a fresh re-auth before consoles and console time limits
-- Certificate pinning for hosts with self-signed certificates, Content-Security-Policy on every
-  page, and an event log of sign-ins and changes in the service journal
+- Certificate pinning for hosts with self-signed certificates (confirmed before any credential is
+  sent, as is a node's SSH host key for SSH password auth), limits on connection tests,
+  Content-Security-Policy on every page, and an event log of sign-ins and changes in the service journal
 - JSON API used by the UI, available to scripts with a session cookie
 
 ## Architecture
@@ -141,6 +147,26 @@ the previous release. Confirm the running version with:
 curl -s http://127.0.0.1:8080/healthz
 ```
 
+### Upgrading from 1.3.0 to 1.4.0
+
+Run `install.sh` from the new release; no configuration changes are needed. The database gets
+new columns automatically (host tags, last known network information, confirmed SSH host key,
+update agent nodes). Things that work differently afterwards:
+
+- A host without a confirmed certificate is no longer pinned silently at its first poll. Hosts that
+  were already pinned keep their pin. For a new host, *Test connection* shows the certificate's
+  fingerprint first and the test runs once you confirm it (see [TLS verification](#tls-verification)).
+- *Test SSH* with password authentication shows the node's SSH host key and sends the password only
+  after you confirm it. SSH jobs with password auth to a node whose host key the dashboard hasn't seen
+  before need that confirmation (Edit host → Test SSH); nodes it already knows keep working. The
+  dashboard key (default) is not affected.
+- The *Upgrade shell* button is replaced by **Update node** through the [update agent](#update-agent),
+  installed once per node with *Set up updates*.
+- The *Open PVE* button is no longer on the dashboard cards (the host page and Hosts list keep it),
+  so people open *Details* instead.
+- A host switched with *Switch to API token* in 1.4.0 gets the `Sys.Syslog` privilege in its PMM
+  role for the update agent.
+
 ### Upgrading from 1.2.x to 1.3.0
 
 Back up the data directory and `.env` first; a rollback to 1.2.x needs that backup:
@@ -157,7 +183,7 @@ Then run `install.sh` from the new release. What changes at the first start:
 - The service refuses to start if `PM_SECRET_KEY` is shorter than 32 characters or has fewer
   than 12 different characters. The installer's key passes; a hand-made one may not.
 - Everyone signs in once more (new session format).
-- Each host's certificate is pinned at its first poll (see [TLS verification](#tls-verification)).
+- Each host's certificate is pinned at its first poll (1.3.0; from 1.4.0 it is confirmed first, see [TLS verification](#tls-verification)).
 - Consoles run through the dashboard ([Consoles](#consoles)). If the dashboard is behind nginx,
   re-run `deploy/enable-https.sh` with the options used originally so nginx passes the console
   websockets. Consoles need sign-in mode 2 or 3 (a second factor for the console re-auth).
@@ -201,6 +227,59 @@ uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
 ## Proxmox API access
 
 Users and tokens are cluster-wide, so a cluster needs one token.
+
+### Limits on connection tests
+
+*Test connection* and *Test SSH* connect from the dashboard to an address you type, with a password or token
+you type, so they are limited to keep the dashboard from being used to guess passwords or scan addresses:
+
+- An address that isn't one of your hosts (host address, cluster node IP or SSH address override) needs the
+  console re-auth (authenticator code / Microsoft sign-in) first.
+- Five failed sign-ins to the same address and port within 10 minutes pause tests of it for 15 minutes (429).
+- Each admin can run 30 tests per 10 minutes.
+- An event `outbound.alert` (outcome *denied*) is written to the service journal when an address
+  reaches the failure limit and when one admin tests five or more different unmanaged addresses in 10 minutes.
+- *Test SSH* with password auth shows the node's SSH host key first and sends the password only after you
+  confirm it (`for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf $f; done` on the node). The confirmed
+  key is saved with the host; SSH jobs with password auth refuse a node whose first key doesn't match it.
+  The dashboard key (default) needs no confirmation: nothing secret is sent to the node.
+
+### Switch to API token
+
+On the host page of a host that signs in as root@pam with a password, or with a root@pam API
+token, admins have **Switch to API token** (after the console re-auth). For a root@pam token
+host the old token is removed from the host after the switch (it has full root access); untick that in the
+dialog to keep it. If Proxmox doesn't let the token create users or tokens, enter the root@pam password in the
+dialog (used once, not stored). Over the Proxmox API, signed in as root@pam:
+
+1. Role `PMM` is created (or its privileges set) with: `Sys.Audit`, `Sys.Modify`, `Sys.PowerMgmt`, `Sys.Syslog`,
+   `VM.Audit`, `VM.PowerMgmt`, `VM.Snapshot`, `VM.Backup`, `VM.Config.Disk`, `VM.Config.Options`, `VM.Console`,
+   `Datastore.Audit`, `Datastore.AllocateSpace`. No user, permission, firewall, storage or cluster changes,
+   no guest deletion or snapshot rollback, no node shell.
+2. User `pmm@pve` is created (Proxmox VE realm) with a 64-character random password that is set and thrown away:
+   never shown, never stored. Nobody can sign in to the web UI as pmm@pve; only its token works. An existing
+   pmm@pve is reused as is.
+3. `PMM` on `/` for pmm@pve, propagated.
+4. API token `pmm@pve!pmm-<UTC timestamp>-<4 random hex>` with privilege separation off, stored encrypted in the dashboard only.
+5. The token has to see the same nodes and guests as root@pam and hold every PMM privilege on `/`.
+   Only then the host switches to the token and the stored root@pam password is removed.
+
+If any step fails, what this run created is removed again (a changed role gets its old privileges back) and the
+host entry is unchanged; the dialog lists every step. Users, roles and tokens are cluster-wide, so one run covers
+a whole cluster. Running it on a second host of the same cluster reuses pmm@pve and adds a token. In the Proxmox
+GUI the result is under Datacenter → Permissions (Users, API Tokens, Roles, Permissions).
+
+Afterwards:
+
+- Polling, guest actions, snapshots, backups, disk expansion, start at boot, Refresh package list, update notes,
+  Reboot node: on the token.
+- VM consoles: on the token (`VM.Console`), no root password. If Proxmox refuses the token for a console, the
+  console says so and the dashboard asks for the root password for that host's consoles for the next hour.
+- Container consoles and the node terminal: Proxmox only allows them for root@pam, so they ask for the
+  root password when opened (typed, not stored unless you tick Remember). Updates without the root password:
+  the [update agent](#update-agent), or the SSH update path where port 22 is reachable. The PMM role
+  includes `Sys.Syslog` so the dashboard can read the agent's output.
+- Going back: Edit host → Password, root@pam and the password. Remove the token in Proxmox if it isn't needed.
 
 ### Read-only monitoring token
 
@@ -248,14 +327,15 @@ names the privilege and path.
 | Function | Required privilege |
 |---|---|
 | Monitoring, SMART, reboot-pending, node network and DNS | `Sys.Audit`, `VM.Audit`, `Datastore.Audit` |
-| Pending update count, package list refresh, repository switch | `Sys.Modify` |
+| Pending update count and update notes (changelogs), package list refresh, repository switch | `Sys.Modify` |
 | Node reboot through the API | `Sys.PowerMgmt` |
 | Guest start / shutdown / stop / restart | `VM.PowerMgmt` |
 | Start at boot | `VM.Config.Options` |
 | Snapshot | `VM.Snapshot` |
 | Backup | `VM.Backup`, `Datastore.AllocateSpace` on the target storage |
 | Disk expansion | `VM.Config.Disk`, `Datastore.AllocateSpace` on the disk's storage |
-| Terminal, upgrade shell, guest console | `root@pam` password (Proxmox does not allow these for API tokens) |
+| Update agent: send a request / read its output | `Sys.Modify` (node notes) / `Sys.Syslog` (node journal) |
+| Terminal, container console | `root@pam` password (Proxmox does not allow these for API tokens) |
 
 To add only the pending-update count to a monitoring token:
 
@@ -279,8 +359,11 @@ Enable it for hosts with an ACME or internal-CA certificate.
 
 Proxmox hosts normally use the self-signed certificate the cluster generates. For those (Verify
 SSL off) the dashboard **pins** the certificate: the SHA-256 fingerprint of the
-certificate the host presents is stored on the host record, when an admin runs *Test connection*
-and saves, or at the first poll. From then on every connection to that address (polling, jobs,
+certificate the host presents is stored on the host record. Nothing is pinned silently:
+*Test connection* first shows the fingerprint (nothing else is sent yet) and runs the real test only after you
+confirm it matches the node; that confirmed fingerprint is saved with the host. A host saved without a
+confirmed certificate stays *pending* and the dashboard sends it nothing until *Check certificate* → *Accept*.
+A new host entry at an address another host already pinned takes that pin. From then on every connection to that address (polling, jobs,
 the root@pam sign-in, console start and the console relay) must present exactly that certificate;
 the check runs right after the TLS handshake, before a token, password or cookie is sent. A
 different certificate stops all traffic to the host and shows *TLS certificate changed* on the
@@ -295,7 +378,7 @@ and click *Accept new certificate*. The Hosts list shows each host as *pinned*, 
 
 Changing a host's address or port: if the new address presents the same pinned certificate (a
 DNS name for the same node, say) the pin and the stored secrets are kept. Otherwise it is
-treated as a different machine: the pin is dropped and pinned again on first use, the token
+treated as a different machine: the pin is dropped and has to be confirmed again, the token
 secret or password has to be entered again (the edit is refused with a blank secret), and a
 saved `root@pam` console password is cleared.
 
@@ -323,7 +406,7 @@ Settings are read from `/opt/proxmox-manager/.env`.
 | `PM_SESSION_MAX_AGE` | `43200` | Session lifetime, seconds |
 | `PM_INITIAL_ADMIN_USERNAME` / `PM_INITIAL_ADMIN_PASSWORD` | unset | Creates an administrator on first start. Remove after use. |
 | `PM_LOG_LEVEL` | `INFO` | `DEBUG` logs every failed Proxmox call |
-| `PM_SHOW_PVE_LINKS` | `true` | Show links to each host's Proxmox web UI. Set `false` when browsers can't reach the hosts; consoles go through the dashboard either way. |
+| `PM_SHOW_PVE_LINKS` | `true` | Show links to each host's Proxmox web UI (host page and hosts list; not on the dashboard cards, so people open Details). Set `false` when browsers can't reach the hosts; consoles go through the dashboard either way. |
 | `PM_CONSOLE_CONNECT_SECONDS` | `120` | A requested console that has not connected within this time is discarded. |
 | `PM_CONSOLE_MAX_SECONDS` | `7200` | Maximum length of one console session (2 hours). |
 | `PM_CONSOLE_IDLE_MINUTES` | `15` | A console closes after this long without activity. |
@@ -678,6 +761,18 @@ node the dashboard signs in through by that much). Proxmox accepts a root@pam si
 another cluster node only when the clocks agree within five minutes, so a drifting node breaks
 consoles while token-based polling keeps working.
 
+**Host tags.** Each host can carry up to 20 free-form tags (up to 40 characters each, no
+commas or angle brackets), set on *Edit host*: type a tag and press Enter or comma, Backspace in
+the empty box removes the last one, and tags already used on other hosts are suggested (picking
+one keeps its spelling). Tags are matched without regard to case. They appear as coloured chips
+(the same tag always has the same colour) on the dashboard cards, in the Hosts list and in the
+host page header, next to the single *Client / group* label that the dashboard groups by. Above
+the dashboard cards a *Tags* bar lists every tag with the number of hosts; click tags to show
+only hosts that have all of the selected ones (click again to remove, *Clear* for none). The
+selection is remembered in that browser, the search box matches tags too, and a tag in a host
+page header opens the dashboard filtered by it. Every role sees tags; only admins change them
+(changes are in the event log as `host.update`, field `tags`).
+
 **Hosts** (admin). Add, edit, test, disable and delete hosts. *Web UI link override* sets the
 address used for links to the Proxmox UI when it differs from the address the dashboard
 polls, for example an address reachable over VPN (not used with `PM_SHOW_PVE_LINKS=false`).
@@ -695,6 +790,10 @@ signs in from; Match system follows the operating system's or browser's light/da
 switches with it. A non-secret `pm_theme` cookie holds a copy only so the sign-in page opens in
 the same theme. Console screens stay black in both themes.
 
+Since 1.4.0 the pages use a "rack panel" look in both themes, like the front of rack equipment: a dark
+top bar and node headers, host cards with a header strip and status LED, segmented usage meters,
+uppercase labels and figures in a monospaced font. Host tags keep their own colours.
+
 ## Node maintenance
 
 ### API mode (default)
@@ -706,17 +805,95 @@ Available with an API token only:
   kernel packages flagged.
 - **Open terminal** opens a root shell on the node (the same console as Node → Shell) in a
   new dashboard tab. See [Console relay](#console-relay) for how the session is set up.
-- **Upgrade shell** opens the node's `pveupgrade` console (Node → Updates → Upgrade) in a new
-  dashboard tab. The button is highlighted in yellow while the node has pending updates.
-  Proxmox only permits these consoles for a `root@pam` session, so the dashboard signs in to
-  the host as `root@pam` server-side. For hosts added with `root@pam` password authentication
-  the stored password is used; otherwise the password is requested and can be saved per host
-  (encrypted). Accounts with two-factor authentication are not supported by this sign-in.
+- **Update node** installs the pending updates through the [update agent](#update-agent)
+  (replaces the Upgrade shell button of 1.3.0). Highlighted in yellow while the node has pending
+  updates. Nodes without the agent show **Set up updates** instead.
 - **Reboot node** issues `POST /nodes/{node}/status command=reboot`, waits for the node's
   uptime to reset and reports the kernel it booted.
 
-Typical sequence: Refresh package list, Upgrade shell (run the upgrade), wait for the next
-poll to show *reboot pending* if a new kernel was installed, then Reboot node.
+Typical sequence: Refresh package list, Update node, then Reboot node if the job (or the next
+poll) shows *reboot required*.
+
+### Update agent
+
+A small Perl service on each node (`pmm-agent`) installs updates when the dashboard
+asks, so updating a node is one click and needs neither the root password nor SSH.
+
+How it works:
+
+- It opens no port and connects nowhere. Every ~10 s it reads the node's Notes through the local
+  `pvesh`. To ask for something, the dashboard writes one signed line into the Notes over the Proxmox API
+  (`PUT /nodes/{node}/config`, sent with the config digest):
+  `<!-- pmm-agent:v1 PAYLOAD.SIGNATURE -->`. The agent removes every such line first, then checks it.
+- Requests are signed with an Ed25519 key that only the dashboard holds (generated on first use, stored
+  encrypted with the other secrets). The node only has the public key (`/etc/pmm-agent/dashboard.pub`).
+  A request names its node, has a random single-use id and expires after 5 minutes, so having API
+  access to the host (or a copy of an old request) is not enough to make the agent do anything.
+- It can do exactly two things: answer a ping, and run `apt-get update` followed by a non-interactive
+  `apt-get dist-upgrade -y` that keeps existing config files (needrestart, if installed, is suspended so no
+  services are restarted automatically). There is no way to send it a command.
+  Reboots stay a separate step (Reboot node, through the API).
+- Its output goes to the journal (unit `pmm-agent`), every line tagged with the request id. The dashboard
+  reads it with `GET /nodes/{node}/syslog?service=pmm-agent` and streams it into the job window. The job
+  keeps waiting if the Proxmox API restarts during the upgrade.
+
+Setting it up (once per node): **Set up updates** on the node → **Open terminal** (root password one last
+time) → **Copy** → paste into the terminal → **Check agent**. The installer writes
+`/usr/local/lib/pmm-agent/pmm-agent.pl`, `/etc/pmm-agent/dashboard.pub` and
+`/etc/systemd/system/pmm-agent.service`, adds `Sys.Syslog` to the PMM role if there is one, and starts
+the service. Remove it with:
+
+```bash
+systemctl disable --now pmm-agent
+rm -rf /usr/local/lib/pmm-agent /etc/pmm-agent /var/lib/pmm-agent /etc/systemd/system/pmm-agent.service
+systemctl daemon-reload
+```
+
+The token needs `Sys.Modify` and `Sys.Syslog`. If `Sys.Syslog` is missing the update is refused
+before a request is sent (so nothing runs that the dashboard can't watch), with the `pveum` command to
+add it. Check on a node: `systemctl status pmm-agent`, `journalctl -u pmm-agent`.
+
+If the dashboard's key is ever lost (new database without a restore), reinstall the agent on each node
+with the new installer; requests signed with the old key are refused.
+
+### When a host can't be reached
+
+When a poll fails:
+
+- The error is followed by *Last up 4h ago (date)*, the last successful poll. Everything shown
+  for the host (figures, versions, guests, storage) is from then.
+- The card footer and the host page header show *last tried …*, the last attempt, so a host that
+  is still being tried doesn't look forgotten. The tooltip has both times.
+- Nodes show *unreachable* with a red dot, guests *unknown* with their last reported state, and the
+  node and guest buttons are hidden until the host answers again. Live-only figures (CPU, load,
+  uptime) are left out.
+- The Network section shows the last network information read from each node (saved every time
+  the section loads), marked *last known* with its date and a note that it may have changed since.
+  It is cleared when a host is pointed at a different machine.
+
+### Update notes and CVE check
+
+Click the *N updates* badge in a node's header on the host page, or on a host's dashboard card
+(all its nodes), to see what the pending updates change Every role can open it.
+
+- Each package shows the installed and the new version, its repository and, once its changelog
+  has been read, a *security* badge and the CVE IDs it fixes. Kernel packages are marked
+  *kernel · reboot*.
+- Expanding a package lists the changelog entries between the installed and the new version:
+  version, date, urgency, the security suite when it came from one (for example
+  `bookworm-security`), and the first line of each change. CVE IDs link to the Debian security
+  tracker.
+- The box at the top checks a CVE (`CVE-2025-1234`, any case) or a word: it says which pending
+  update fixes it and in which version, or that it is already fixed in the installed version of
+  a pending package, or that no pending update mentions it.
+
+The changelogs are downloaded by the node from its repository through the Proxmox API
+(`GET /nodes/{node}/apt/changelog`, at most four at a time, kept for 12 hours), so the node needs
+the same internet access it uses for apt, and the token needs `Sys.Modify` like the update
+list. Versions are compared like dpkg. Limits: only packages with a pending update are checked;
+a fix that a changelog doesn't name by CVE ID isn't found; Proxmox kernel changelogs name the
+Ubuntu kernel they are based on (for example `Ubuntu-6.14.0-29.29`), not individual CVEs, so
+for a kernel CVE check Ubuntu's notice for that kernel.
 
 ### Repository check
 
@@ -913,9 +1090,13 @@ All endpoints under `/api/` require a session cookie. Obtain one by posting to `
 | POST | `/api/hosts/{id}/refresh` | any | Poll one host |
 | POST | `/api/refresh-all` | any | Start a full poll cycle |
 | GET | `/api/hosts/{id}/nodes/{node}/disks` | any | Physical disks with last SMART result |
+| GET | `/api/hosts/{id}/nodes/{node}/updates/notes?name=&version=` | any | Update notes for one pending package: changelog entries between installed and new, CVE IDs, CVEs already fixed in the installed version |
 | POST | `/api/hosts/{id}/nodes/{node}/smart` | any | `{"devpath": "/dev/sda"}`: read SMART for one disk |
 | POST | `/api/hosts/{id}/nodes/{node}/smart/all` | any | Read SMART for all disks on the node |
 | POST | `/api/hosts/{id}/nodes/{node}/refresh-packages` | admin | Package list refresh through the API → `{job_id}` |
+| GET | `/api/agent/installer` | admin | Update agent installer block, uninstall commands, key fingerprint |
+| POST | `/api/hosts/{id}/nodes/{node}/agent/ping` | admin | Signed ping to the node's update agent (up to ~45 s) → `{ok, agent}` or `{ok: false, error}` |
+| POST | `/api/hosts/{id}/nodes/{node}/agent/upgrade` | admin | `{"confirm": "<node>"}`: install updates through the update agent → `{job_id}` |
 | POST | `/api/hosts/{id}/nodes/{node}/api-reboot` | admin | `{"confirm": "<node>"}`: reboot through the API → `{job_id}` |
 | POST | `/api/hosts/{id}/nodes/{node}/check-updates` | admin | Update check over SSH → `{job_id}` |
 | POST | `/api/hosts/{id}/nodes/{node}/upgrade` | admin | `{"confirm": "<node>", "auto_reboot": false}`: upgrade over SSH → `{job_id}` |
@@ -940,7 +1121,7 @@ All endpoints under `/api/` require a session cookie. Obtain one by posting to `
 | GET | `/api/ssh/key` | admin | Dashboard SSH public key |
 | POST | `/api/ssh/key/generate` | admin | Generate or replace the dashboard key pair |
 | POST | `/api/ssh/test` | admin | Test SSH credentials |
-| GET, POST, PUT, DELETE | `/api/hosts`, `/api/hosts/{id}` | admin | Host management |
+| GET, POST, PUT, DELETE | `/api/hosts`, `/api/hosts/{id}` | admin | Host management (`tags`: list of strings; leave it out on PUT to keep the current tags) |
 | POST | `/api/hosts/test` | admin | Test host credentials without saving |
 | GET, POST, PUT, DELETE | `/api/users`, `/api/users/{id}` | admin | User management (`must_change_password`: the user sets a new password at next sign-in; set on create and when an admin sets someone else's password) |
 | GET | `/api/me` | any | Own account, sign-in mode and authenticator state |

@@ -201,9 +201,14 @@ async def console_create(host_id: int, body: ConsoleIn, request: Request, db: Db
     else:
         _summary_node(host, body.node)
 
-    reused = None if body.password else consoles.reuse_ticket(user.id, host.id)
+    # VM consoles on a host switched to an API token use the token (no root password),
+    # unless a password was typed or the token was refused for a console recently.
+    use_token = body.kind == "vm" and not body.password and consoles.token_vm_consoles(host)
+    reused = None if (body.password or use_token) else consoles.reuse_ticket(user.id, host.id)
     source = ""
-    if reused:
+    if use_token:
+        ticket, csrf, source = "", "", "api token"
+    elif reused:
         ticket, csrf = reused
     else:
         source = _password_source(host)
@@ -236,7 +241,7 @@ async def console_create(host_id: int, body: ConsoleIn, request: Request, db: Db
             db.commit()
     s = await asyncio.to_thread(consoles.create, user, host, body.node, body.vmid if body.kind in ("vm", "ct") else None,
                                 body.kind, name, _ip(request), ticket, csrf, sid, _stepup_method(user, sid),
-                                request.session.get(SESSION_AT_KEY, 0))
+                                request.session.get(SESSION_AT_KEY, 0), "token" if use_token else "ticket")
     note(request, action="console.open", node=body.node, vmid=body.vmid,
          details={"kind": body.kind, "label": s.label, "log_id": s.log_id, "stepup": s.stepup_method,
                   "root_login": source or "saved", "remembered": bool(source == "typed" and body.remember)} if not reused else
@@ -304,11 +309,14 @@ async def console_reconnect(sid: str, request: Request, db: DbSession = Depends(
     if old.connected and not old.finished:
         raise HTTPException(409, "This console is still open. Close it first; Reconnect is for a console that has ended.")
     host = db.get(ProxmoxHost, old.host_id)
-    reused = consoles.reuse_ticket(user.id, old.host_id)
+    if host is not None and old.auth == "token" and consoles.token_vm_consoles(host):
+        reused, auth = ("", ""), "token"
+    else:
+        reused, auth = consoles.reuse_ticket(user.id, old.host_id), "ticket"
     if host is None or reused is None:
         raise HTTPException(409, "The sign-in to the host has expired. Open the console again from the host page.")
     s = await asyncio.to_thread(consoles.create, user, host, old.node, old.vmid, old.kind, old.name, _ip(request), *reused,
-                                browser_sid, _stepup_method(user, browser_sid), request.session.get(SESSION_AT_KEY, 0))
+                                browser_sid, _stepup_method(user, browser_sid), request.session.get(SESSION_AT_KEY, 0), auth)
     consoles.forget(old.id)
     note(request, action="console.reconnect", host_name=host.name, node=old.node, vmid=old.vmid,
          details={"kind": old.kind, "label": s.label, "log_id": s.log_id, "previous_log_id": old.log_id, "stepup": s.stepup_method})

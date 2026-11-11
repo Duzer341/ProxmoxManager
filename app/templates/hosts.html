@@ -42,7 +42,7 @@
 
 <div class="card table-wrap" style="padding:0">
   <table id="hosts"><thead><tr>
-    <th>Name</th><th>Client</th><th>Endpoint</th><th>Auth</th><th>PVE user</th><th>TLS</th><th>SSH</th><th>Status</th><th>Last OK</th><th></th>
+    <th>Name</th><th>Client</th><th>Tags</th><th>Endpoint</th><th>Auth</th><th>PVE user</th><th>TLS</th><th>SSH</th><th>Status</th><th>Last OK</th><th></th>
   </tr></thead><tbody><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table>
 </div>
 
@@ -55,6 +55,8 @@
         <div class="field"><label>Display name</label><input type="text" id="f-name" required placeholder="e.g. ACME PVE cluster"></div>
         <div class="field"><label>Client / group (optional)</label><input type="text" id="f-client" placeholder="e.g. ACME Corp" list="client-list"><datalist id="client-list"></datalist></div>
       </div>
+      <div class="field"><label for="f-tags-box">Tags (optional)</label><div id="f-tags-box"></div>
+        <div class="hint">Type a tag and press Enter or comma. Up to 20, shown on the dashboard where you can filter by them.</div></div>
       <div class="row three">
         <div class="field"><label>Host (IP or DNS name)</label><input type="text" id="f-host" required placeholder="10.0.0.5 or pve1.client.local"></div>
         <div class="field"><label>Port</label><input type="number" id="f-port" value="8006" min="1" max="65535"></div>
@@ -131,6 +133,22 @@
           <button type="button" class="btn sm" id="ssh-forget" style="display:none" title="Clear pinned SSH host keys (after a node reinstall)">Forget SSH host keys</button>
           <span class="muted" id="ssh-test-status" style="font-size:12.5px"></span>
         </div>
+        <!-- confirm the node's SSH host key before an SSH password is sent -->
+        <div class="confirm-box" id="ssh-confirm" style="display:none">
+          <div><b>Confirm the node's SSH host key.</b> The password has not been sent yet.</div>
+          <div class="mono fp" id="ssh-confirm-fp"></div>
+          <div class="muted">Compare it on the node: <span class="mono">for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf $f; done</span></div>
+          <div class="flex" style="margin-top:6px"><button type="button" class="btn sm primary" id="ssh-confirm-go">It matches: test SSH</button>
+            <button type="button" class="btn sm" id="ssh-confirm-no">It doesn't match</button></div>
+        </div>
+      </div>
+      <!-- confirm the certificate before any token / password is sent -->
+      <div class="confirm-box" id="tls-confirm" style="display:none">
+        <div><b>Confirm the host's certificate.</b> Nothing has been sent to it yet.</div>
+        <div class="mono fp" id="tls-confirm-fp"></div>
+        <div class="muted">Compare it on the node: <span class="mono">openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256</span></div>
+        <div class="flex" style="margin-top:6px"><button type="button" class="btn sm primary" id="tls-confirm-go">It matches: test the connection</button>
+          <button type="button" class="btn sm" id="tls-confirm-no">It doesn't match</button></div>
       </div>
       <div class="foot">
         <button type="button" class="btn danger" id="f-delete" style="display:none; margin-right:auto">Delete host</button>
@@ -155,6 +173,19 @@
   </div>
 </div>
 
+<!-- testing an address that isn't a managed host needs a fresh re-auth -->
+<div class="modal-bg" id="ostep-modal">
+  <div class="modal" style="max-width:460px">
+    <h2>Verify it's you</h2>
+    <p style="margin-top:0" id="ostep-why">Testing an address that isn't one of your hosts needs a fresh check.</p>
+    <div id="ostep-totp"><div class="field"><label for="ostep-code">Current code from your authenticator app</label>
+      <input type="text" id="ostep-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false"></div></div>
+    <p id="ostep-entra" style="display:none">You'll be sent to Microsoft to sign in again, then back to this page. Test again afterwards.</p>
+    <p class="bad-text" id="ostep-err" style="display:none; font-size:13px"></p>
+    <div class="foot"><button class="btn" data-close="ostep-modal">Cancel</button><button class="btn primary" id="ostep-go">Verify and test</button></div>
+  </div>
+</div>
+
 <div class="modal-bg" id="deleted-modal">
   <div class="modal" style="max-width:680px">
     <h2 id="deleted-title">Host deleted</h2>
@@ -171,17 +202,22 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
   const tb = document.querySelector("#hosts tbody");
   let hosts = [];
   const $ = function (id) { return document.getElementById(id); };
+  const tagEditor = PM.tagInput($("f-tags-box"), { placeholder: "e.g. backup-target, site-erie" });
 
   function render() {
     const clients = {};
     hosts.forEach(function (h) { if (h.client) clients[h.client] = 1; });
     $("client-list").innerHTML = Object.keys(clients).sort().map(function (c) { return '<option value="' + PM.esc(c) + '">'; }).join("");
-    if (!hosts.length) { tb.innerHTML = '<tr><td colspan="10" class="empty">No hosts yet. Click "Add host".</td></tr>'; return; }
+    const allTags = {};
+    hosts.forEach(function (h) { (h.tags || []).forEach(function (t) { allTags[t.toLowerCase()] = allTags[t.toLowerCase()] || t; }); });
+    tagEditor.suggest(Object.keys(allTags).sort().map(function (k) { return allTags[k]; }));
+    if (!hosts.length) { tb.innerHTML = '<tr><td colspan="11" class="empty">No hosts yet. Click "Add host".</td></tr>'; return; }
     tb.innerHTML = hosts.map(function (h) {
       const status = !h.enabled ? '<span class="badge">disabled</span>' : h.last_error ? '<span class="badge bad" title="' + PM.esc(h.last_error) + '">error</span>' : h.last_ok_at ? '<span class="badge ok">ok</span>' : '<span class="badge warn">pending</span>';
       return '<tr>' +
         '<td><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></td>' +
         '<td>' + PM.esc(h.client || "-") + '</td>' +
+        '<td><div class="tags">' + (h.tags && h.tags.length ? PM.tagChips(h.tags) : '<span class="muted">-</span>') + '</div></td>' +
         '<td class="mono">' + PM.esc(h.host) + ':' + h.port + (SHOW_PVE ? ' <a href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open PVE">↗</a>' : "") + '</td>' +
         '<td><span class="badge">' + (h.auth_type === "token" ? "token" : "password") + '</span></td>' +
         '<td class="mono">' + PM.esc(h.pve_user) + (h.auth_type === "token" ? "!" + PM.esc(h.token_name) : "") + '</td>' +
@@ -234,6 +270,7 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
 
   function openForm(h) {
     $("host-form").reset();
+    confirmedSshKey = ""; $("tls-confirm").style.display = "none"; $("ssh-confirm").style.display = "none";
     $("test-status").textContent = "";
     $("ssh-test-status").textContent = "";
     $("f-ssh").checked = h ? !!h.ssh_enabled : false;
@@ -246,6 +283,7 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
     $("modal-title").textContent = h ? "Edit host" : "Add host";
     $("f-name").value = h ? h.name : "";
     $("f-client").value = h ? h.client : "";
+    tagEditor.set(h ? h.tags : []);
     $("f-host").value = h ? h.host : "";
     $("f-port").value = h ? h.port : 8006;
     $("f-verify").checked = h ? h.verify_ssl : false;
@@ -289,6 +327,7 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
 
   // ---- TLS pin ----
   let testedFingerprint = "";   // from Test connection; pinned when the host is saved
+  let confirmedSshKey = "", sshOffered = "";   // SSH host key the admin confirmed (password auth)
   let editingHost = null;
   function renderTls() {
     const el = $("f-tls"), acts = $("f-tls-actions");
@@ -300,17 +339,17 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
     const sameTarget = h && $("f-host").value.trim().toLowerCase() === (h.host || "").toLowerCase() && parseInt($("f-port").value, 10) === h.port && !h.verify_ssl;
     if (testedFingerprint) {
       el.innerHTML = 'Certificate SHA-256 <span class="mono">' + PM.esc(testedFingerprint) + '</span><br>' +
-        (sameTarget && h.tls_fingerprint === testedFingerprint ? "Matches the pinned certificate." : "Pinned when you save.");
+        (sameTarget && h.tls_fingerprint === testedFingerprint ? "Matches the pinned certificate." : "Confirmed; pinned when you save.");
     } else if (sameTarget && h.tls_fingerprint) {
       el.innerHTML = 'Pinned certificate SHA-256 <span class="mono">' + PM.esc(h.tls_fingerprint) + '</span>';
     } else {
-      el.textContent = "Proxmox's self-signed certificate is pinned on first use: Test connection shows its fingerprint, or it is pinned at the first poll after saving.";
+      el.textContent = "Proxmox's self-signed certificate must be confirmed: Test connection shows its fingerprint to compare with the node before anything is sent. Until then the dashboard doesn't contact the host.";
     }
     acts.style.display = sameTarget ? "" : "none";
   }
   $("f-verify").addEventListener("change", renderTls);
-  $("f-host").addEventListener("input", function () { testedFingerprint = ""; renderTls(); });
-  $("f-port").addEventListener("input", function () { testedFingerprint = ""; renderTls(); });
+  $("f-host").addEventListener("input", function () { testedFingerprint = ""; confirmedSshKey = ""; $("tls-confirm").style.display = "none"; renderTls(); });
+  $("f-port").addEventListener("input", function () { testedFingerprint = ""; $("tls-confirm").style.display = "none"; renderTls(); });
   let presentedFingerprint = "";
   $("f-tls-check").addEventListener("click", async function () {
     const btn = this, st = $("f-tls-status");
@@ -348,6 +387,7 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
       node_names: nodeNamesBody(),
       name: $("f-name").value.trim(),
       client: $("f-client").value.trim(),
+      tags: tagEditor.get(),
       host: $("f-host").value.trim(),
       port: parseInt($("f-port").value, 10) || 8006,
       web_url: $("f-web").value.trim(),
@@ -363,26 +403,71 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
       ssh_port: parseInt($("f-ssh-port").value, 10) || 22,
       ssh_auth: $("f-ssh-auth").value,
       ssh_secret: sshSecret(),
-      ssh_node_addrs: $("f-ssh-addrs").value
+      ssh_node_addrs: $("f-ssh-addrs").value,
+      ssh_host_key: confirmedSshKey || undefined
     };
   }
 
   // ---- SSH: test + forget keys ----
-  $("ssh-test").addEventListener("click", async function () {
-    const btn = this, st = $("ssh-test-status");
+  async function runSshTest() {
+    const btn = $("ssh-test"), st = $("ssh-test-status");
     const body = { host: $("f-host").value.trim(), ssh_user: $("f-ssh-user").value.trim() || "root",
-      ssh_port: parseInt($("f-ssh-port").value, 10) || 22, ssh_auth: $("f-ssh-auth").value, ssh_secret: sshSecret() };
+      ssh_port: parseInt($("f-ssh-port").value, 10) || 22, ssh_auth: $("f-ssh-auth").value, ssh_secret: sshSecret(),
+      ssh_host_key: confirmedSshKey };
     if ($("f-id").value) body.host_id = parseInt($("f-id").value, 10);
     if (!body.host) { st.className = "bad-text"; st.textContent = "Enter the host address first."; return; }
     PM.busy(btn, true, "Testing");
     st.className = "muted"; st.textContent = "Connecting…";
     try {
       const r = await PM.api("POST", "/api/ssh/test", body);
-      if (r.ok) { st.className = r.warning ? "warn-text" : "ok-text"; st.textContent = "OK — " + r.hostname + (r.pveversion ? " · " + r.pveversion : "") + " · kernel " + r.kernel + (r.warning ? " · " + r.warning : ""); }
+      if (r.needs_confirm) {
+        sshOffered = r.ssh_host_key; $("ssh-confirm-fp").textContent = r.ssh_host_key; $("ssh-confirm").style.display = "";
+        st.className = "warn-text"; st.textContent = r.error;
+      } else if (r.ok) { st.className = r.warning ? "warn-text" : "ok-text"; st.textContent = "OK — " + r.hostname + (r.pveversion ? " · " + r.pveversion : "") + " · kernel " + r.kernel + (r.warning ? " · " + r.warning : ""); }
       else { st.className = "bad-text"; st.textContent = r.error; }
-    } catch (err) { st.className = "bad-text"; st.textContent = err.message; }
+    } catch (err) {
+      if (!stepupNeeded(err, runSshTest)) { st.className = "bad-text"; st.textContent = err.message; }
+      else { st.className = "muted"; st.textContent = "Verify it's you to test this address."; }
+    }
     PM.busy(btn, false);
+  }
+  $("ssh-test").addEventListener("click", runSshTest);
+  $("ssh-confirm-go").addEventListener("click", function () {
+    confirmedSshKey = sshOffered; $("ssh-confirm").style.display = "none"; runSshTest();
   });
+  $("ssh-confirm-no").addEventListener("click", function () {
+    confirmedSshKey = ""; $("ssh-confirm").style.display = "none";
+    $("ssh-test-status").className = "bad-text";
+    $("ssh-test-status").textContent = "Not confirmed: nothing was sent. Check the address, or whether something is intercepting the connection.";
+  });
+
+  // ---- re-auth for testing an address that isn't a managed host ----
+  let ostepRetry = null;
+  function stepupNeeded(err, retry) {
+    if (!(err && err.data && err.data.stepup_required)) return false;
+    ostepRetry = retry;
+    const methods = err.data.methods || [];
+    if (!methods.length) { PM.toast(err.message, "bad"); return true; }
+    const entra = methods.indexOf("entra") !== -1;
+    $("ostep-totp").style.display = entra ? "none" : ""; $("ostep-entra").style.display = entra ? "" : "none";
+    $("ostep-go").textContent = entra ? "Sign in with Microsoft" : "Verify and test";
+    $("ostep-code").value = ""; $("ostep-err").style.display = "none";
+    PM.openModal("ostep-modal");
+    if (!entra) setTimeout(function () { $("ostep-code").focus(); }, 50);
+    return true;
+  }
+  $("ostep-go").addEventListener("click", async function () {
+    if ($("ostep-entra").style.display !== "none") { location.href = "/auth/entra/stepup?next=" + encodeURIComponent(location.pathname); return; }
+    const code = $("ostep-code").value.replace(/\s/g, ""), err = $("ostep-err");
+    if (!/^\d{6}$/.test(code)) { err.textContent = "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
+    const go = this; go.disabled = true;
+    try { PM.stepup.set(await PM.api("POST", "/api/stepup", { code: code })); }
+    catch (e) { go.disabled = false; err.textContent = e.message; err.style.display = ""; return; }
+    go.disabled = false;
+    PM.closeModal("ostep-modal");
+    if (ostepRetry) ostepRetry();
+  });
+  $("ostep-code").addEventListener("keydown", function (e) { if (e.key === "Enter") $("ostep-go").click(); });
   $("ssh-forget").addEventListener("click", async function () {
     const id = $("f-id").value; if (!id) return;
     if (!confirm("Forget the pinned SSH host keys for this host? Only do this after a node was reinstalled.")) return;
@@ -541,21 +626,37 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
     }
   });
 
-  $("test").addEventListener("click", async function () {
-    const btn = this, st = $("test-status");
+  let offeredFingerprint = "";
+  async function runTest() {
+    const btn = $("test"), st = $("test-status");
     const body = formBody();
     if ($("f-id").value) body.host_id = parseInt($("f-id").value, 10);
     PM.busy(btn, true, "Testing");
     st.className = "status muted"; st.textContent = "Connecting…";
     try {
       const r = await PM.api("POST", "/api/hosts/test", body);
-      if (r.ok) {
+      if (r.needs_confirm) {
+        offeredFingerprint = r.tls_fingerprint; $("tls-confirm-fp").textContent = r.tls_fingerprint;
+        $("tls-confirm").style.display = ""; st.className = "status warn-text"; st.textContent = "Confirm the certificate below.";
+      } else if (r.ok) {
         st.className = "status ok-text"; st.textContent = "OK — PVE " + r.version + ", nodes: " + r.nodes.join(", ");
         testedFingerprint = r.tls_fingerprint || ""; renderTls();
       }
       else { st.className = "status bad-text"; st.textContent = r.error; }
-    } catch (err) { st.className = "status bad-text"; st.textContent = err.message; }
+    } catch (err) {
+      if (!stepupNeeded(err, runTest)) { st.className = "status bad-text"; st.textContent = err.message; }
+      else { st.className = "status muted"; st.textContent = "Verify it's you to test this address."; }
+    }
     PM.busy(btn, false);
+  }
+  $("test").addEventListener("click", runTest);
+  $("tls-confirm-go").addEventListener("click", function () {
+    testedFingerprint = offeredFingerprint; $("tls-confirm").style.display = "none"; renderTls(); runTest();
+  });
+  $("tls-confirm-no").addEventListener("click", function () {
+    testedFingerprint = ""; $("tls-confirm").style.display = "none"; renderTls();
+    $("test-status").className = "status bad-text";
+    $("test-status").textContent = "Not confirmed: nothing was sent. Check the address, or whether something is intercepting the connection.";
   });
 
   $("host-form").addEventListener("submit", async function (e) {

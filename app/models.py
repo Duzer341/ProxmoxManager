@@ -118,11 +118,18 @@ class ProxmoxHost(Base):
     # appkey = the dashboard's own generated keypair; key = pasted private key; password
     ssh_auth: Mapped[str] = mapped_column(String(16), nullable=False, default="appkey")
     ssh_secret_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")  # key PEM or password
+    # SSH host key fingerprint (SHA256:...) the admin confirmed with Test SSH; with SSH password auth a
+    # node's first key must match it before the password is sent
+    ssh_host_key: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # nodes with the update agent, JSON {"node": {"version": 1, "seen_at": iso}}
+    agent_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Optional per-node SSH address overrides, JSON {"node": "ip-or-dns"}; otherwise the
     # cluster-reported node IP is used, or the host address for single nodes.
     ssh_node_addrs: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # optional friendly name per cluster node, JSON {"node": "name"} (host page, console titles)
     node_names: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # free-form labels, JSON list ["site-erie", "backup-target"] (dashboard chips + filter)
+    tags: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Optional root@pam password used only to sign the browser in to the PVE web UI
     # (Upgrade shell). Fernet-encrypted; empty = ask each time.
     console_secret_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -132,6 +139,9 @@ class ProxmoxHost(Base):
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     last_summary_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # last network read per node, JSON {"node": {"at": iso, "net": {...}}}, shown (marked as
+    # last known) while the host or node can't be reached
+    network_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     samples = relationship("StatSample", back_populates="host", cascade="all, delete-orphan")
     smart_results = relationship("SmartResult", back_populates="host", cascade="all, delete-orphan")
@@ -266,6 +276,43 @@ class ConsoleLog(Base):
     bytes_from_host: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # how the console re-auth was done (totp / entra)
     stepup_method: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+
+
+TAG_MAX = 20          # tags per host
+TAG_MAX_LEN = 40      # characters per tag
+
+
+def tags_of(host) -> list[str]:
+    """A host's tags ([] when none or unreadable)."""
+    import json
+
+    try:
+        d = json.loads(getattr(host, "tags", "") or "[]")
+    except ValueError:
+        return []
+    return [str(t) for t in d if str(t).strip()] if isinstance(d, list) else []
+
+
+def clean_tags(values) -> list[str]:
+    """Trimmed, inner whitespace collapsed, case-insensitive duplicates dropped (first spelling kept),
+    in the order given. Raises ValueError for too many / too long / control characters."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values or []:
+        t = " ".join(str(v).split())
+        if not t:
+            continue
+        if len(t) > TAG_MAX_LEN:
+            raise ValueError(f"Tag '{t[:20]}…' is longer than {TAG_MAX_LEN} characters.")
+        if any(ord(c) < 32 or c in "<>," for c in t):
+            raise ValueError(f"Tag '{t}' has a character tags can't contain (comma, < or >).")
+        if t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        out.append(t)
+    if len(out) > TAG_MAX:
+        raise ValueError(f"A host can have at most {TAG_MAX} tags.")
+    return out
 
 
 def node_names_of(host) -> dict[str, str]:

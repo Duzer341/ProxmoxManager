@@ -13,7 +13,7 @@ from urllib.parse import quote
 from .. import auth_device, entra, events, loginconfig, mfa, ratelimit, stepup
 from ..events import note
 from ..auth import (SSO_RECHECK_KEY, get_current_user_optional, hash_password, login_user, logout_user, session_id,
-                    validate_password_strength, verify_password)
+                    validate_password_strength, verify_password, burn_password_check)
 from ..config import settings
 from ..permissions import role_can
 from ..database import get_db
@@ -137,6 +137,8 @@ def login_submit(
         when = f"{wait} seconds" if wait < 120 else f"{wait // 60} minutes"
         return _login_page(request, cfg, f"Too many failed sign-in attempts. Try again in {when}.",
                            next, show_local=True, status_code=429, username=username)
+    if not user or not user.is_active or user.is_sso:
+        burn_password_check(password)   # constant work on the miss path
     if not user or not user.is_active or user.is_sso or not verify_password(password, user.password_hash):
         ratelimit.failure(username, ip)
         log.warning("sign-in failed user=%s ip=%s", username if user else events.mask_username(username), ip)

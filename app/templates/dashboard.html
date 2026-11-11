@@ -5,7 +5,7 @@
   <h1>Dashboard</h1>
   <span class="sub" id="updated">Loading…</span>
   <div class="actions">
-    <input type="text" class="search" id="search" placeholder="Filter by name, client, host, version…">
+    <input type="text" class="search" id="search" placeholder="Filter by name, client, tag, host, version…">
     <select id="sort" style="width:auto">
       <option value="client">Group by client</option>
       <option value="name">Name</option>
@@ -20,12 +20,12 @@
 </div>
 
 <div class="tiles" id="tiles"></div>
+<div class="tag-filter" id="tag-filter" style="display:none"></div>
 <div class="grid" id="grid"><div class="empty">Loading…</div></div>
 {% endblock %}
 
 {% block scripts %}
 <script nonce="{{ csp_nonce }}">
-const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
 (function () {
   const grid = document.getElementById("grid");
   const tiles = document.getElementById("tiles");
@@ -55,10 +55,58 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
       tile("Updates", f.updates, (f.repo_warnings ? '<span class="bad-text">' + f.repo_warnings + ' node(s) can\'t see Proxmox updates</span>' : "") + (f.repo_warnings && f.reboot_pending ? " · " : "") + (f.reboot_pending ? '<span class="bad-text">' + f.reboot_pending + ' node(s) need a reboot</span>' : (f.repo_warnings ? "" : "pending packages across all nodes")), f.updates ? "warn-text" : "");
   }
 
+  // tag filter (click a tag; several = hosts that have all of them), remembered in this browser
+  let tagSel = [];
+  try { tagSel = JSON.parse(localStorage.getItem("pm.tags") || "[]"); if (!Array.isArray(tagSel)) tagSel = []; } catch (e) { tagSel = []; }
+  const tagParam = new URLSearchParams(location.search).get("tag");
+  if (tagParam) { tagSel = [tagParam]; saveTags(); history.replaceState(null, "", "/"); }
+  function saveTags() { try { localStorage.setItem("pm.tags", JSON.stringify(tagSel)); } catch (e) {} }
+  function hasTag(h, t) { return (h.tags || []).some(function (x) { return x.toLowerCase() === t.toLowerCase(); }); }
+  function toggleTag(t) {
+    const i = tagSel.findIndex(function (x) { return x.toLowerCase() === t.toLowerCase(); });
+    if (i === -1) tagSel.push(t); else tagSel.splice(i, 1);
+    saveTags(); render();
+  }
+  function renderTagFilter() {
+    const bar = document.getElementById("tag-filter");
+    const all = {};
+    data.hosts.forEach(function (h) { (h.tags || []).forEach(function (t) { const k = t.toLowerCase(); all[k] = all[k] || { t: t, n: 0 }; all[k].n++; }); });
+    tagSel = tagSel.filter(function (t) { return all[t.toLowerCase()]; });   // tags that no longer exist
+    const keys = Object.keys(all).sort();
+    if (!keys.length) { bar.style.display = "none"; return; }
+    bar.style.display = "";
+    bar.innerHTML = '<span class="label">Tags</span>' + keys.map(function (k) {
+      const on = tagSel.some(function (x) { return x.toLowerCase() === k; });
+      return PM.tagChip(all[k].t, { click: true, active: on }).replace("</span>", ' <small class="muted">' + all[k].n + '</small></span>');
+    }).join("") + (tagSel.length ? ' <button class="btn sm link" id="tag-clear">Clear</button>' : "");
+  }
+  // update notes from the card's badge (the full summary carries the per-node package lists)
+  document.addEventListener("click", async function (e) {
+    const b = e.target.closest("[data-updhost]");
+    if (!b) return;
+    const id = b.getAttribute("data-updhost");
+    try {
+      const h = await PM.api("GET", "/api/hosts/" + id);
+      const names = h.node_names || {};
+      PM.updateNotes(Number(id), h.name, ((h.summary || {}).nodes || []).filter(function (n) { return n.updates; })
+        .map(function (n) { return { node: n.node, label: names[n.node] || "", updates_list: n.updates_list }; }));
+    } catch (err) { PM.toast(err.message, "bad"); }
+  });
+  document.addEventListener("click", function (e) {
+    const c = e.target.closest("[data-tag]");
+    if (c && (c.closest("#tag-filter") || c.closest("#grid"))) { e.preventDefault(); toggleTag(c.getAttribute("data-tag")); }
+    if (e.target.id === "tag-clear") { tagSel = []; saveTags(); render(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    const c = e.target.closest && e.target.closest("[data-tag]");
+    if (c && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleTag(c.getAttribute("data-tag")); }
+  });
+
   function matches(h, q) {
+    if (tagSel.length && !tagSel.every(function (t) { return hasTag(h, t); })) return false;
     if (!q) return true;
     const s = h.summary || {};
-    const hay = [h.name, h.client, h.host, s.version, s.cluster_name, (s.pve_versions || []).join(" "), (s.nodes || []).map(function (n) { return n.node; }).join(" ")].join(" ").toLowerCase();
+    const hay = [h.name, h.client, h.host, (h.tags || []).join(" "), s.version, s.cluster_name, (s.pve_versions || []).join(" "), (s.nodes || []).map(function (n) { return n.node; }).join(" ")].join(" ").toLowerCase();
     return hay.indexOf(q) !== -1;
   }
 
@@ -91,9 +139,9 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
           (s.is_cluster ? '<span class="badge ' + (s.quorate === false ? "bad" : "") + '" title="Cluster">' + PM.esc(s.cluster_name) + (s.quorate === false ? " – no quorum" : "") + '</span>' : '<span class="badge">standalone</span>') +
           '<span>Nodes <b>' + s.nodes_online + '/' + s.node_count + '</b></span>' +
           '<span>Guests <b class="ok-text">' + s.guests_running + '</b> up, <b>' + s.guests_stopped + '</b> down' +
-            (s.guests_unknown ? ', <b class="warn-text" title="On nodes that are offline">' + s.guests_unknown + '</b> unknown' : "") + '</span>' +
-          '<span>Uptime <b>' + PM.uptime(maxUptime) + '</b></span>' +
-          (s.updates ? '<span class="badge warn" title="Pending apt updates across nodes">' + s.updates + ' update' + (s.updates === 1 ? "" : "s") + '</span>' : "") +
+            (s.guests_unknown ? ', <b class="warn-text" title="' + (s.unreachable ? "Host not reachable: state unknown" : "On nodes that are offline") + '">' + s.guests_unknown + '</b> unknown' : "") + '</span>' +
+          (s.unreachable ? "" : '<span>Uptime <b>' + PM.uptime(maxUptime) + '</b></span>') +
+          (s.updates ? '<button type="button" class="badge warn" data-updhost="' + h.id + '" title="Pending apt updates across nodes. Click for what they change and which CVEs they fix.">' + s.updates + ' update' + (s.updates === 1 ? "" : "s") + ' ›</button>' : "") +
           (s.repo_warning_nodes && s.repo_warning_nodes.length ? '<span class="badge bad" title="Proxmox updates are not visible on: ' + PM.esc(s.repo_warning_nodes.join(", ")) + ' (enterprise repo without subscription, or no Proxmox repo). Open the host for details.">repo problem</span>' : "") +
           (s.reboot_pending_nodes && s.reboot_pending_nodes.length ? '<span class="badge bad" title="Newer kernel installed than running on: ' + PM.esc(s.reboot_pending_nodes.join(", ")) + '">reboot pending</span>' : "") +
         '</div>' +
@@ -101,30 +149,32 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
         PM.meter("RAM", s.mem_pct, PM.bytes(s.mem_used) + ' <small>/ ' + PM.bytes(s.mem_total) + '</small>', avg.mem_pct, 85, 95) +
         PM.meter("Disk", s.disk_pct, PM.bytes(s.disk_used) + ' <small>/ ' + PM.bytes(s.disk_total) + '</small>', avg.disk_pct, 80, 90);
     }
-    if (h.last_error) body += '<div class="err">' + PM.esc(h.last_error) + '</div>';
+    if (h.last_error) body += '<div class="err">' + PM.esc(h.last_error) + '</div><div class="err-since" data-lastup>' + PM.esc(PM.lastUp(h)) + '</div>';
     if (!s && !h.last_error) body += '<div class="muted">' + (h.enabled ? "Waiting for first poll…" : "Polling disabled.") + '</div>';
 
     return '<div class="card host-card ' + h.state + '" data-id="' + h.id + '">' +
       '<div class="head"><span class="dot ' + dot + '" style="margin-top:6px"></span>' +
         '<div><div class="title"><a href="/hosts/' + h.id + '">' + PM.esc(h.name) + '</a></div>' +
-          '<div class="client">' + PM.esc(h.client || "") + (h.client ? " · " : "") + '<span class="mono">' + PM.esc(h.host) + '</span></div></div>' +
-        (SHOW_PVE ? '<div class="right"><a class="btn sm" href="' + PM.esc(h.ui_url) + '" target="_blank" rel="noopener" title="Open the Proxmox web UI">Open PVE ↗</a></div>' : "") +
+          '<div class="client">' + PM.esc(h.client || "") + (h.client ? " · " : "") + '<span class="mono">' + PM.esc(h.host) + '</span></div>' +
+          (h.tags && h.tags.length ? '<div class="tags">' + h.tags.map(function (t) { return PM.tagChip(t, { click: true, active: tagSel.some(function (x) { return x.toLowerCase() === t.toLowerCase(); }) }); }).join("") + '</div>' : "") +
+        '</div>' +
       '</div>' +
       body +
       '<div class="foot"><a class="btn sm" href="/hosts/' + h.id + '">Details</a>' +
         (h.enabled ? '<button class="btn sm" data-refresh="' + h.id + '">Refresh</button>' : "") +
-        '<span class="ago" title="' + PM.esc(h.last_poll_at || "") + '">' + (h.last_ok_at ? "polled " + PM.ago(h.last_ok_at) : "never polled") + '</span></div>' +
+        '<span class="ago" title="' + PM.esc(PM.pollTitle(h)) + '">' + PM.esc(PM.pollText(h)) + '</span></div>' +
     '</div>';
   }
 
   function render() {
     if (!data) return;
     renderTiles(data.fleet);
+    renderTagFilter();
     const q = search.value.trim().toLowerCase();
     const mode = sortSel.value;
     const hosts = sortHosts(data.hosts.filter(function (h) { return matches(h, q); }), mode);
     if (!hosts.length) {
-      grid.innerHTML = '<div class="empty">' + (data.hosts.length ? "No hosts match your filter." : 'No Proxmox hosts yet.{% if current_user.is_admin %} <a href="/manage/hosts">Add one</a>.{% endif %}') + '</div>';
+      grid.innerHTML = '<div class="empty">' + (data.hosts.length ? (tagSel.length ? "No hosts have all of the selected tags." : "No hosts match your filter.") : 'No Proxmox hosts yet.{% if current_user.is_admin %} <a href="/manage/hosts">Add one</a>.{% endif %}') + '</div>';
       return;
     }
     let html = "", lastGroup = null;

@@ -108,8 +108,18 @@ def node_address(host: ProxmoxHost, node: str, summary: dict | None) -> str:
 # Connection
 # --------------------------------------------------------------------------- #
 
+class HostKeyConfirm(Exception):
+    """an SSH password is about to go to a host key nobody confirmed. Raised during
+    the key exchange, before any authentication, so the password is never sent."""
+
+    def __init__(self, fp: str):
+        super().__init__(f"SSH host key {fp} not confirmed")
+        self.fingerprint = fp
+
+
 class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
-    """Trust on first use; refuse if a node's key changes."""
+    """Trust on first use for key auth; refuse if a node's key changes. With password auth a
+    first-seen key must be the one the admin confirmed on the host form (Test SSH)."""
 
     def __init__(self, db: Session, host: ProxmoxHost, node: str, address: str):
         self.db, self.host, self.node, self.address = db, host, node, address
@@ -119,6 +129,12 @@ class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
             self.db.query(SshHostKey).filter(SshHostKey.host_id == self.host.id, SshHostKey.node == self.node).first()
         )
         b64 = key.get_base64()
+        if row is None and self.host.ssh_auth == "password" and fingerprint(key) != (self.host.ssh_host_key or "").strip():
+            raise SshError(
+                f"SSH host key {fingerprint(key)} of {self.node} ({self.address}) hasn't been confirmed, so the SSH password "
+                "was not sent. Edit the host and use Test SSH to confirm the key (check it on the node with "
+                "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub), or switch to the dashboard key."
+            )
         if row is None:
             self.db.add(
                 SshHostKey(
@@ -220,12 +236,16 @@ class _ProbeHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     any password or key is offered; an address seen for the first time is accepted but not pinned
     (pinning happens at the first real connection of a saved host)."""
 
-    def __init__(self, db: Session, address: str):
+    def __init__(self, db: Session, address: str, require_confirm: bool = False, confirmed: str = ""):
         self.db, self.address = db, address
+        self.require_confirm, self.confirmed = require_confirm, (confirmed or "").strip()
 
     def missing_host_key(self, client, hostname, key):  # noqa: D401
         rows = self.db.query(SshHostKey).filter(SshHostKey.address == self.address).all()
         if not rows:
+            # a password only goes to a host key the admin confirmed
+            if self.require_confirm and fingerprint(key) != self.confirmed:
+                raise HostKeyConfirm(fingerprint(key))
             return
         if any(r.key_type == key.get_name() and r.key_b64 == key.get_base64() for r in rows):
             return
@@ -235,11 +255,13 @@ class _ProbeHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         )
 
 
-def probe(db: Session, address: str, port: int, username: str, auth: str, secret: str) -> dict[str, Any]:
+def probe(db: Session, address: str, port: int, username: str, auth: str, secret: str,
+          confirmed_key: str = "") -> dict[str, Any]:
     """Connectivity + auth check for the host form's 'Test SSH' button. Does not pin host keys, but
-    refuses an address whose pinned key changed."""
+    refuses an address whose pinned key changed. With password auth an unpinned address's key must be
+    confirmed first (HostKeyConfirm, raised before the password is sent)."""
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(_ProbeHostKeyPolicy(db, address))
+    client.set_missing_host_key_policy(_ProbeHostKeyPolicy(db, address, auth == "password", confirmed_key))
     kwargs: dict[str, Any] = dict(
         hostname=address, port=port, username=username or "root", timeout=CONNECT_TIMEOUT,
         banner_timeout=20, auth_timeout=20, allow_agent=False, look_for_keys=False,
@@ -252,6 +274,9 @@ def probe(db: Session, address: str, port: int, username: str, auth: str, secret
         kwargs["pkey"] = _app_private_key(db)
     try:
         client.connect(**kwargs)
+    except HostKeyConfirm:
+        client.close()
+        raise
     except paramiko.AuthenticationException as exc:
         raise SshError(
             f"SSH authentication failed for {kwargs['username']}@{address}: {exc}. "

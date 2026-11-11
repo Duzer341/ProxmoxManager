@@ -4,10 +4,11 @@ Most Proxmox hosts use the self-signed certificate the cluster generates, so ful
 ("Verify SSL") is off for them. Without a pin that meant no verification at all: anyone on the path
 between the dashboard and a host could read the API token, the root@pam password and tickets.
 
-Hosts with Verify SSL off are now pinned on first use: the SHA-256 fingerprint of the certificate the
-host presents is stored on the host record (when an admin tests the connection and saves, or at the
-first poll), and from then on every connection to that address must present exactly that
-certificate. The check runs right after the TLS handshake and before any request bytes (and so
+Hosts with Verify SSL off are pinned: the SHA-256 fingerprint of the certificate the host presents is
+stored on the host record, and every connection to that address must present exactly that certificate.
+nothing is pinned silently on first use any more. The admin confirms
+the fingerprint (Test connection shows it before any credential is sent; or Edit host > Check
+certificate > Accept), and until then the dashboard sends nothing to the host. The check runs right after the TLS handshake and before any request bytes (and so
 before any token, password or cookie) are sent:
 
 - requests / proxmoxer (polling, jobs, root@pam sign-in, console start): urllib3's assert_fingerprint,
@@ -35,6 +36,10 @@ from requests.adapters import HTTPAdapter
 log = logging.getLogger(__name__)
 
 MISMATCH_MARK = "certificate changed"
+PENDING_MARK = "certificate not confirmed"
+PENDING_MESSAGE = ("The host's TLS " + PENDING_MARK + " yet (no certificate is pinned), so nothing was sent to it. "
+                   "Edit host > Check certificate, compare the fingerprint with the node "
+                   "(openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256) and accept it.")
 
 _local = threading.local()   # per thread: {(host, port): fingerprint} of the host being contacted
 
@@ -155,10 +160,9 @@ def prepare(host) -> str:
     if not fp and not getattr(host, "id", None):
         fp = saved_pin(host.host, host.port)   # a test of an address a saved host already pinned: keep that pin
     if not fp:
-        fp = fetch(host.host, host.port)
-        if getattr(host, "id", None):
-            fp = _store_first_pin(host, fp)
-        host.tls_fingerprint = fp
+        # no silent pin on first use. Nothing is sent until an admin confirms the certificate.
+        set_pin(host.host, host.port, None)
+        raise PinError(PENDING_MESSAGE)
     set_pin(host.host, host.port, fp)
     return fp
 
