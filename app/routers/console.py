@@ -82,7 +82,8 @@ def _require_stepup(request: Request, db: DbSession, user: User) -> str:
     if not methods:
         raise stepup.StepUpRequired(stepup.blocked_reason(user, cfg), [])
     raise stepup.StepUpRequired("Verify it's you to open consoles: " + (
-        "sign in with Microsoft again." if methods == ["entra"] else "enter a new code from your authenticator app."), methods)
+        "sign in with Microsoft again." if methods == ["entra"] else "enter your password again." if methods == ["password"]
+        else "enter a new code from your authenticator app."), methods)
 
 
 def _stepup_method(user: User, sid: str) -> str:
@@ -110,6 +111,7 @@ def stepup_get(request: Request, db: DbSession = Depends(get_db), user: User = D
 
 class StepUpIn(BaseModel):
     code: str = Field(default="", max_length=32)
+    password: str = Field(default="", max_length=128)   # 1.4.2: password-only sign-in
 
 
 @api.post("/stepup")
@@ -118,6 +120,8 @@ def stepup_verify(body: StepUpIn, request: Request, db: DbSession = Depends(get_
     from fastapi.responses import JSONResponse
 
     cfg = loginconfig.load(db)
+    if "password" in stepup.methods_for(user, cfg):
+        return _stepup_password(body, request, db, user)
     if "totp" not in stepup.methods_for(user, cfg):
         if user.is_sso:
             raise HTTPException(400, "Microsoft accounts verify with a fresh Microsoft sign-in (/auth/entra/stepup).")
@@ -154,6 +158,36 @@ def stepup_verify(body: StepUpIn, request: Request, db: DbSession = Depends(get_
         note(request, details={"signed_out": "too many wrong console re-auth codes"})
         return JSONResponse({"detail": "Too many wrong codes. You have been signed out.", "signed_out": True}, status_code=401)
     raise HTTPException(400, why)
+
+
+def _stepup_password(body: StepUpIn, request: Request, db: DbSession, user: User):
+    """1.4.2: console re-auth on a dashboard that signs in with a password only (no authenticators): the account's
+    password, typed again. Same window, attempt limits and sign-out after too many wrong tries as a code."""
+    from fastapi.responses import JSONResponse
+
+    from ..auth import verify_password
+
+    ip = _ip(request)
+    sid = session_id(request)
+    note(request, category="auth", action="stepup")
+    if ratelimit.locked(user.username, ip, known_device=True):
+        raise HTTPException(429, "Too many wrong passwords. Wait a few minutes and try again.")
+    u = db.get(User, user.id)
+    if body.password and verify_password(body.password, u.password_hash):
+        until = stepup.grant(user.id, sid, "password", ip)
+        ratelimit.success(user.username, ip)
+        _log.info("console re-auth ok user=%s method=password ip=%s", user.username, ip)
+        note(request, outcome="ok", details={"method": "password", "window_minutes": round(stepup.window_seconds() / 60, 1)})
+        return {**_stepup_public(request, db, user), "until": until}
+    ratelimit.failure(user.username, ip)
+    n = stepup.failure(user.id, sid)
+    _log.warning("console re-auth failed user=%s ip=%s attempt=%d method=password", user.username, ip, n)
+    note(request, outcome="failed", details={"method": "password", "attempt": n, "reason": "wrong password"})
+    if n >= stepup.MAX_FAILS:
+        logout_user(request)
+        note(request, details={"signed_out": "too many wrong console re-auth passwords"})
+        return JSONResponse({"detail": "Too many wrong passwords. You have been signed out.", "signed_out": True}, status_code=401)
+    raise HTTPException(400, "Wrong password." if body.password else "Enter your password.")
 
 
 @api.post("/stepup/drop")

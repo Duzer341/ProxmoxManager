@@ -178,7 +178,7 @@
   <div class="modal" style="max-width:460px">
     <h2>Verify it's you</h2>
     <p style="margin-top:0" id="ostep-why">Testing an address that isn't one of your hosts needs a fresh check.</p>
-    <div id="ostep-totp"><div class="field"><label for="ostep-code">Current code from your authenticator app</label>
+    <div id="ostep-totp"><div class="field"><label for="ostep-code" id="ostep-label">Current code from your authenticator app</label>
       <input type="text" id="ostep-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false"></div></div>
     <p id="ostep-entra" style="display:none">You'll be sent to Microsoft to sign in again, then back to this page. Test again afterwards.</p>
     <p class="bad-text" id="ostep-err" style="display:none; font-size:13px"></p>
@@ -450,6 +450,11 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
     if (!methods.length) { PM.toast(err.message, "bad"); return true; }
     const entra = methods.indexOf("entra") !== -1;
     $("ostep-totp").style.display = entra ? "none" : ""; $("ostep-entra").style.display = entra ? "" : "none";
+    const pw = methods.indexOf("password") !== -1;   // 1.4.2: password-only sign-in
+    const inp = $("ostep-code");
+    inp.type = pw ? "password" : "text"; inp.maxLength = pw ? 128 : 6; inp.dataset.pw = pw ? "1" : "";
+    inp.autocomplete = pw ? "current-password" : "one-time-code";
+    $("ostep-label").textContent = pw ? "Your dashboard password" : "Current code from your authenticator app";
     $("ostep-go").textContent = entra ? "Sign in with Microsoft" : "Verify and test";
     $("ostep-code").value = ""; $("ostep-err").style.display = "none";
     PM.openModal("ostep-modal");
@@ -458,10 +463,11 @@ const SHOW_PVE = {{ 'true' if show_pve_links else 'false' }};
   }
   $("ostep-go").addEventListener("click", async function () {
     if ($("ostep-entra").style.display !== "none") { location.href = "/auth/entra/stepup?next=" + encodeURIComponent(location.pathname); return; }
-    const code = $("ostep-code").value.replace(/\s/g, ""), err = $("ostep-err");
-    if (!/^\d{6}$/.test(code)) { err.textContent = "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
+    const pw = $("ostep-code").dataset.pw === "1";
+    const code = pw ? $("ostep-code").value : $("ostep-code").value.replace(/\s/g, ""), err = $("ostep-err");
+    if (pw ? !code : !/^\d{6}$/.test(code)) { err.textContent = pw ? "Enter your password." : "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
     const go = this; go.disabled = true;
-    try { PM.stepup.set(await PM.api("POST", "/api/stepup", { code: code })); }
+    try { PM.stepup.set(await PM.api("POST", "/api/stepup", pw ? { password: code } : { code: code })); }
     catch (e) { go.disabled = false; err.textContent = e.message; err.style.display = ""; return; }
     go.disabled = false;
     PM.closeModal("ostep-modal");

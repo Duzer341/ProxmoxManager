@@ -186,7 +186,8 @@ Then run `install.sh` from the new release. What changes at the first start:
 - Each host's certificate is pinned at its first poll (1.3.0; from 1.4.0 it is confirmed first, see [TLS verification](#tls-verification)).
 - Consoles run through the dashboard ([Consoles](#consoles)). If the dashboard is behind nginx,
   re-run `deploy/enable-https.sh` with the options used originally so nginx passes the console
-  websockets. Consoles need sign-in mode 2 or 3 (a second factor for the console re-auth).
+  websockets. Consoles need a fresh check: an authenticator code in sign-in modes 2 and 3, a Microsoft
+  sign-in for Microsoft accounts, or (from 1.4.2) the account password again in mode 1.
 - Existing accounts keep their roles; the new `technician` role is assigned on the Users page.
   Admins and technicians without an authenticator need an enrollment code at their next
   sign-in in modes 2 and 3 (`manage.py enroll-code <username>`, see
@@ -631,6 +632,9 @@ websocket need a recent re-auth on top of the normal sign-in:
 - **Local accounts:** a new code from the authenticator app. Recovery (backup) codes are
   refused here, and a code that was already used, for example at sign-in, cannot be used again.
   Five wrong codes in a row sign the browser out; they also count towards the account lockout.
+- **Local accounts, sign-in mode 1 (password only):** since 1.4.2 the account's password again, with the same
+  window and the same limits (five wrong passwords sign the browser out). For a second factor before consoles,
+  switch to mode 2 with `manage.py configure-login`.
 - **Microsoft accounts:** a forced fresh Microsoft sign-in (`prompt=login`, `max_age=0`,
   `login_hint`). The ID token must come back for the same account (`oid`), still carry a role
   that may open consoles, and contain an `auth_time` no older than the request. **Add the

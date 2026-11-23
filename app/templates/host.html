@@ -147,9 +147,9 @@
     <p style="margin-top:0" id="stepup-why">Consoles need a fresh check, even when you're signed in. Afterwards you can open consoles from this
       browser for <b id="stepup-mins">15</b> minutes. Using them doesn't extend that.</p>
     <div id="stepup-totp">
-      <div class="field"><label for="stepup-code">Current code from your authenticator app</label>
+      <div class="field"><label for="stepup-code" id="stepup-label">Current code from your authenticator app</label>
         <input type="text" id="stepup-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false"></div>
-      <p class="muted" style="font-size:12.5px; margin-top:-4px">Backup codes don't work here. A code you already used to sign in can't be used again; wait for the next one.</p>
+      <p class="muted" style="font-size:12.5px; margin-top:-4px" id="stepup-hint">Backup codes don't work here. A code you already used to sign in can't be used again; wait for the next one.</p>
     </div>
     <div id="stepup-entra" style="display:none">
       <p>You'll be sent to Microsoft to sign in again (password and any MFA your organization requires), then brought back
@@ -1253,6 +1253,19 @@
   }
 
   let stepupTarget = null;
+  // 1.4.2: with password-only sign-in the console re-auth asks for the account password instead of a code
+  function pwMode(on) {
+    const inp = document.getElementById("stepup-code");
+    inp.type = on ? "password" : "text";
+    inp.maxLength = on ? 128 : 6;
+    inp.inputMode = on ? "text" : "numeric";
+    inp.autocomplete = on ? "current-password" : "one-time-code";
+    inp.dataset.pw = on ? "1" : "";
+    document.getElementById("stepup-label").textContent = on ? "Your dashboard password" : "Current code from your authenticator app";
+    document.getElementById("stepup-hint").textContent = on
+      ? "This dashboard signs in with a password only, so consoles check your password again."
+      : "Backup codes don't work here. A code you already used to sign in can't be used again; wait for the next one.";
+  }
   function askStepup(target, err, loaded) {
     stepupTarget = target;
     if (!PM.stepup.state && !loaded) { PM.stepup.load().then(function () { askStepup(target, err, true); }); return; }
@@ -1269,6 +1282,7 @@
     }
     document.getElementById("stepup-mins").textContent = st ? Math.round(st.window_minutes) : 15;
     document.getElementById("stepup-totp").style.display = entra ? "none" : "";
+    pwMode(methods.indexOf("password") !== -1);
     document.getElementById("stepup-entra").style.display = entra ? "" : "none";
     const go = document.getElementById("stepup-go");
     go.textContent = entra ? "Sign in with Microsoft" : (autoLogin(target) ? "Verify and open" : "Verify");
@@ -1285,9 +1299,10 @@
       location.href = "/auth/entra/stepup?next=" + encodeURIComponent(location.pathname);
       return;
     }
-    const code = document.getElementById("stepup-code").value.replace(/\s/g, "");
+    const inp = document.getElementById("stepup-code"), pw = inp.dataset.pw === "1";
+    const code = pw ? inp.value : inp.value.replace(/\s/g, "");
     const err = document.getElementById("stepup-err");
-    if (!/^\d{6}$/.test(code)) { err.textContent = "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
+    if (pw ? !code : !/^\d{6}$/.test(code)) { err.textContent = pw ? "Enter your password." : "Enter the 6-digit code from your authenticator app."; err.style.display = ""; return; }
     const target = stepupTarget;
     // With a saved root password no other dialog follows, so open the tab now, inside the click.
     const w = autoLogin(target) ? window.open("about:blank", "pmconsole_" + Date.now()) : null;
@@ -1296,7 +1311,7 @@
     const go = this;
     go.disabled = true;
     try {
-      PM.stepup.set(await PM.api("POST", "/api/stepup", { code: code }));
+      PM.stepup.set(await PM.api("POST", "/api/stepup", pw ? { password: code } : { code: code }));
     } catch (e) {
       if (w) { try { w.close(); } catch (x) {} }
       go.disabled = false;

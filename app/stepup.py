@@ -42,11 +42,14 @@ def window_seconds() -> int:
 
 
 def methods_for(user, cfg) -> list[str]:
-    """How this user can re-auth for consoles ([] = can't, see blocked_reason)."""
+    """How this user can re-auth for consoles ([] = can't, see blocked_reason).
+    1.4.2: with password-only sign-in (no authenticators on this dashboard) the re-auth is the account password."""
     if user.is_sso:
         return ["entra"] if cfg.sso_enabled and cfg.entra_ready else []
     if user.mfa_enabled and user.mfa_secret_enc:
         return ["totp"]
+    if not cfg.mfa_available:
+        return ["password"]
     return []
 
 
@@ -55,8 +58,7 @@ def blocked_reason(user, cfg) -> str:
         return "Microsoft sign-in is not configured on this dashboard, so the console re-auth can't run."
     if cfg.mfa_available:
         return "Consoles need an authenticator app. Set one up on your Account page first."
-    return ("Consoles need a fresh check with an authenticator app or a Microsoft sign-in, but this dashboard "
-            "signs in with a password only. An admin can change that with manage.py configure-login.")
+    return "Consoles need a fresh check, which isn't available for this account."
 
 
 def _purge(now: float) -> None:
