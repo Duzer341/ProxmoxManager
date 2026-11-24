@@ -10,8 +10,40 @@ disk expansion, start at boot) without opening each host's web UI.
 The application has no runtime dependency on external CDNs or internet services and can
 run on an isolated management network.
 
+## Quick install
+
+On a fresh Debian 12 or Ubuntu 24.04 VM or LXC container that can reach your Proxmox hosts on port 8006:
+
+1. **Get the code**
+
+   ```bash
+   sudo apt update && sudo apt install -y git
+   git clone https://github.com/Duzer341/ProxmoxManager.git
+   cd ProxmoxManager
+   ```
+
+2. **Run the installer** and answer its two questions: the first admin's username and password, then how
+   people sign in (*Username and password with authenticator app* is recommended; note the one-time
+   enrollment code it prints, you enter it with your first authenticator code at the first sign-in)
+
+   ```bash
+   sudo bash install.sh
+   ```
+
+3. **Open the dashboard and add a host.** Browse to `http://<server-ip>:8080`, sign in, go to *Hosts* →
+   *Add host*, enter the host's address, `root@pam` and its password, click *Test connection*, check the
+   certificate fingerprint it shows against the host and save. Then open the host and click
+   *Switch to API token*: the dashboard creates its own least-privilege `pmm@pve` API token on the host and
+   stops using the root password.
+
+Optional, but recommended before anyone else uses it: serve it over HTTPS with
+`sudo /opt/proxmox-manager/deploy/enable-https.sh --self-signed` (or your own certificate, see [HTTPS](#https)).
+To upgrade later: `git pull` in the same folder and run `sudo bash install.sh` again.
+The rest of this README covers every option in detail.
+
 ## Contents
 
+- [Quick install](#quick-install)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
